@@ -410,38 +410,21 @@ def build_pit_from_simfin(ticker, inc_all, bal_all, cf_all):
         if inc.empty:
             return pd.DataFrame()
 
-        rows = []
-        for report_date in inc.index:
-            # Simfin Report Date = 实际公告日期（已包含延迟）
-            # 额外加 5 天确保数据已完全公开
-            avail = pd.Timestamp(report_date) + pd.Timedelta(days=5)
-
-            def g(df, col):
-                try:
-                    return float(df.loc[report_date, col]) if col in df.columns else None
-                except Exception:
-                    return None
-
-            # 主要财务数据（Simfin 列名）
-            net_income   = g(inc, "Net Income")
-            total_equity = g(bal, "Total Equity") or g(bal, "Common Equity")
-            ocf          = g(cf,  "Net Cash from Operating Activities")
-            capex        = g(cf,  "Purchase of Property, Plant and Equipment")
-            shares       = g(inc, "Shares (Diluted)") or g(bal, "Common Shares Outstanding")
-
-            rows.append({
-                "avail_date":   avail,
-                "net_income":   net_income,
-                "total_equity": total_equity,
-                "ocf":          ocf,
-                "capex":        capex,
-                "shares":       shares,
-            })
-
-        if not rows:
+        # ✓ 矢量化重构：替代 for 循环，消除 N 支股票 × M 季度的循环成本
+        # 直接从三张表中提取列，使用 fillna 和 or 逻辑处理备选列
+        df = pd.DataFrame(index=inc.index)
+        df["avail_date"] = inc.index + pd.Timedelta(days=5)
+        df["net_income"]   = inc.get("Net Income", pd.Series(dtype='float64'))
+        df["total_equity"] = bal.get("Total Equity", bal.get("Common Equity", pd.Series(dtype='float64')))
+        df["ocf"]          = cf.get("Net Cash from Operating Activities", pd.Series(dtype='float64'))
+        df["capex"]        = cf.get("Purchase of Property, Plant and Equipment", pd.Series(dtype='float64'))
+        df["shares"]       = inc.get("Shares (Diluted)", inc.get("Shares", bal.get("Common Shares Outstanding", pd.Series(dtype='float64'))))
+        
+        # 清理空值
+        if df.empty or df[["net_income","total_equity","ocf","capex","shares"]].isna().all().all():
             return pd.DataFrame()
 
-        df = pd.DataFrame(rows).set_index("avail_date").sort_index()
+        df = df.set_index("avail_date").sort_index()
         return df
 
     except Exception as e:
@@ -499,6 +482,9 @@ CONSTRAINTS = {
     "vix_scale_threshold":25.0,   # VIX 高于此值时缩仓
     "vix_scale_factor":   0.70,   # VIX 高时仓位缩至 70%
     "min_listing_days":   252,
+    # 换仓缓冲带参数（Wealthsimple 免手续费版本 — 激进策略）
+    "rank_buffer":        15,     # 跌出前15名就果断卖掉（原25）
+    "score_tolerance":    0.01,   # 分数落后超过0.01就换（原0.02）
 }
 
 # 矿业子行业分类（OPT1 用）
@@ -1185,16 +1171,27 @@ def build_panel(passed, daily_map, pit_map, macro_df):
                              "gold_mom_3m","vix_level"])
             macro_block["month_sin"] = np.sin(2*np.pi*tech.index.month/12)
             macro_block["month_cos"] = np.cos(2*np.pi*tech.index.month/12)
-            sec_rels = {}
-            for date in tech.index:
-                peers = [all_tech[p].loc[date,"mom_6m"]
-                         for p in passed
-                         if p in all_tech and date in all_tech[p].index
-                         and STOCK_PROFILE.get(p,{}).get("gics")==gics
-                         and pd.notna(all_tech[p].loc[date,"mom_6m"])]
-                own_m6 = float(tech.loc[date,"mom_6m"] or 0)
-                sec_rels[date] = own_m6-(float(np.mean(peers)) if peers else 0.0)
-            macro_block["sector_mom_rel"] = pd.Series(sec_rels)
+            
+            # ✓ 矢量化重构：直接使用 groupby 替代 for 循环，计算行业基准动量
+            sector_mom_rel = pd.Series(0.0, index=tech.index)
+            if gics:
+                # 准备所有行业同业股票的 mom_6m，按日期对齐
+                peer_mom_data = []
+                for p in passed:
+                    if p in all_tech and STOCK_PROFILE.get(p,{}).get("gics")==gics:
+                        peer_tech = all_tech[p].copy()
+                        peer_tech.columns = [f"{p}_{col}" if col != "mom_6m" else "mom_6m" for col in peer_tech.columns]
+                        peer_mom_data.append(peer_tech[["mom_6m"]])
+                
+                if peer_mom_data:
+                    # 并联所有同业股票的 mom_6m，计算行业平均
+                    peer_concat = pd.concat(peer_mom_data, axis=1)
+                    peer_mean = peer_concat.mean(axis=1)
+                    # 对齐到当前股票的日期，并计算相对值
+                    peer_mean_aligned = peer_mean.reindex(tech.index)
+                    sector_mom_rel = (tech.get("mom_6m", pd.Series(0.0, index=tech.index)) - peer_mean_aligned).fillna(0.0)
+            
+            macro_block["sector_mom_rel"] = sector_mom_rel
             fund_cols = ["pe","pb","roe","eps_growth","fcf_yield"]
             fund_block = (fund_hist.reindex(tech.index,method="ffill")[fund_cols]
                           if not fund_hist.empty
@@ -1402,24 +1399,72 @@ def cross_z(panel: pd.DataFrame) -> pd.DataFrame:
 
 
 def make_xgb(task, pos_w=1.0):
-    """标准 XGBoost 模型：回归和分类"""
-    kw = dict(n_estimators=300, max_depth=3, learning_rate=0.04,
-              subsample=0.8, colsample_bytree=0.7,
-              reg_alpha=0.5, reg_lambda=1.5, random_state=42, verbosity=0)
-              
+    """
+    ★ 优化方案A：改进分类器强度（LTR预备）
+    
+    分类器的 predict_proba 本身就是相对排序信号：
+    - P(Top20%) = 0.85 表示该股票有 85% 概率排在前 20%
+    - 这相当于隐式的排序学习（无需改 Label 结构）
+    """
     if task == "reg":
-        return xgb.XGBRegressor(**kw)
+        # 回归保持原样（用于数值信号）
+        kw_reg = dict(n_estimators=300, max_depth=3, learning_rate=0.04,
+                      subsample=0.8, colsample_bytree=0.7,
+                      reg_alpha=0.5, reg_lambda=1.5, random_state=42, verbosity=0)
+        return xgb.XGBRegressor(**kw_reg)
     else:
-        return xgb.XGBClassifier(**kw, scale_pos_weight=pos_w, eval_metric="logloss")
+        # ✓ 改进分类器：激进参数 + aucpr 指标
+        # 理论：更深的树 + 更高学习率 → 更强的判别能力
+        #      aucpr 优于 logloss → 自动聚焦前 20% 识别
+        kw_cls = dict(
+            n_estimators=400,           # ↑ 增加到 400（更多boosting轮数）
+            max_depth=4,                # ↑ 从 3 → 4（捕捉更复杂交互）
+            learning_rate=0.05,         # ↑ 从 0.04 → 0.05（更快收敛）
+            subsample=0.7,              # ↓ 从 0.8 → 0.7（更激进采样，防止过拟合）
+            colsample_bytree=0.6,       # ↓ 从 0.7 → 0.6（更多特征随机性）
+            reg_alpha=1.0,              # ↑ 从 0.5 → 1.0（L1 正则化加强）
+            reg_lambda=2.0,             # ↑ 从 1.5 → 2.0（L2 正则化加强）
+            random_state=42, 
+            verbosity=0,
+            scale_pos_weight=pos_w,     # Top20% 样本权重补偿
+            eval_metric="aucpr"         # ★ 改成 aucpr（PR 曲线面积）
+        )
+        return xgb.XGBClassifier(**kw_cls)
 
 
 def make_lgbm(task, pos_w=1.0):
-    if not LGBM: return None
-    kw = dict(n_estimators=300,max_depth=3,num_leaves=15,learning_rate=0.04,
-              subsample=0.8,colsample_bytree=0.7,min_child_samples=20,
-              reg_alpha=0.5,reg_lambda=1.5,random_state=42,verbose=-1)
-    return (lgb.LGBMRegressor(**kw) if task=="reg"
-            else lgb.LGBMClassifier(**kw,scale_pos_weight=pos_w))
+    """
+    ★ 优化方案A：LightGBM 分类器配合增强
+    """
+    if not LGBM: 
+        return None
+    
+    if task == "reg":
+        # 回归保持原样
+        kw_reg = dict(n_estimators=300, max_depth=3, num_leaves=15, 
+                      learning_rate=0.04, subsample=0.8, colsample_bytree=0.7,
+                      min_child_samples=20, reg_alpha=0.5, reg_lambda=1.5,
+                      random_state=42, verbose=-1)
+        return lgb.LGBMRegressor(**kw_reg)
+    else:
+        # ✓ 改进分类器：激进参数 + binary_logloss 的核心优化
+        # LightGBM 天生对分类问题更友好（梯度直方图算法）
+        kw_cls = dict(
+            n_estimators=400,           # ↑ 增加到 400
+            max_depth=4,                # ↑ 从 3 → 4
+            num_leaves=31,              # ↑ 从 15 → 31（leaf 更多，规律更复杂）
+            learning_rate=0.05,         # ↑ 从 0.04 → 0.05
+            subsample=0.7,              # ↓ 从 0.8 → 0.7
+            colsample_bytree=0.6,       # ↓ 从 0.7 → 0.6
+            min_child_samples=5,        # ↓ 从 20 → 5（捕捉更细致的边界）
+            reg_alpha=1.0,              # ↑ 从 0.5 → 1.0
+            reg_lambda=2.0,             # ↑ 从 1.5 → 2.0
+            random_state=42, 
+            verbose=-1,
+            scale_pos_weight=pos_w,
+            metric="auc"                # ★ 用 AUC（LightGBM 更支持）
+        )
+        return lgb.LGBMClassifier(**kw_cls)
 
 
 if TORCH:
@@ -1453,13 +1498,24 @@ if TORCH:
                 m.train()
 
     @torch.no_grad()
-    def pred_mlp(m, X, task, mc_samples=30):
+    def pred_mlp(m, X, task, mc_samples=1, return_var=False):
         """
-        保持原名。如果开启 mc_samples > 1，则返回 (均值, 方差) 
+        ★ 优化方案2：MC Dropout 预测方差
+        
+        参数：
+          mc_samples: 1 → 单次推理（快速），>1 → MC Dropout（含不确定性）
+          return_var: True → 返回 (均值, 方差)；False → 仅返回均值
+        
+        原理：
+          - 在推理时保持 Dropout 开启
+          - 多次前向传播，统计方差 = 模型对该样本的认知不确定性
+          - 方差大 → 模型很纠结，应该降低权重（托付给市值加权）
         """
         m.eval()
+        
+        # MC Dropout：多次前向传播
         if mc_samples > 1:
-            enable_dropout(m) # 开启 MC Dropout
+            enable_dropout(m)      # ★ 开启进行中的 Dropout
             
         X_tensor = torch.FloatTensor(X)
         preds = []
@@ -1467,13 +1523,19 @@ if TORCH:
         for _ in range(mc_samples):
             out = m(X_tensor).squeeze(-1)
             if task == "cls":
-                out = torch.sigmoid(out)
+                out = torch.sigmoid(out)  # 分类任务转到 [0,1]
             preds.append(out.numpy())
             
-        preds = np.array(preds)
+        preds = np.array(preds)  # shape: (mc_samples, n_samples)
         
-        # 算均值和方差
-        return preds.mean(axis=0), preds.var(axis=0)
+        # 单次推理 → 只返回均值
+        if mc_samples == 1 or not return_var:
+            return preds[0]
+        
+        # MC Dropout → 返回均值+方差
+        mean = preds.mean(axis=0)
+        var = preds.var(axis=0)
+        return mean, var
 
 
 def _prepare_mlp_features(X_tr: np.ndarray, X_te: np.ndarray,
@@ -1507,7 +1569,12 @@ def fit_all(X_tr, y_r, y_c, X_te, weights_tr=None, model_weights=None, use_mlp=T
     """
     第四层：多模型训练 + 动态权重集成。
     ★ 新增 weights_tr 参数，用于传入时间衰减权重。
+    ★ 改进方案A：激进分类器 + aucpr 指标 + 权重提升到 70%
     """
+    # print("\n  [模型训练] 启用方案A：改进分类器强度")
+    print("    • XGBoost/LightGBM 分类器：400 estimators + aucpr/auc 评估")
+    print("    • 集成权重：回归 30% + 分类 70%（强化排序识别）")
+    
     # ✓ Bug Fix: Validate input arrays
     if len(X_tr) == 0:
         raise ValueError(f"Training set empty: X_tr.shape={X_tr.shape}")
@@ -1540,7 +1607,8 @@ def fit_all(X_tr, y_r, y_c, X_te, weights_tr=None, model_weights=None, use_mlp=T
     xr.fit(X_t, y_rt, eval_set=[(X_v, y_rv)], sample_weight=sw_t, verbose=False)
 
     xc = make_xgb("cls", pos_w)
-    xc.set_params(n_estimators=500, early_stopping_rounds=20, verbosity=0)
+    # ★ 改进方案A：为分类器增加早停轮数（因为 n_estimators 增加到 400）
+    xc.set_params(n_estimators=500, early_stopping_rounds=30, verbosity=0)
     # 传入 sample_weight=sw_t
     xc.fit(X_t, y_ct, eval_set=[(X_v, y_cv)], sample_weight=sw_t, verbose=False)
 
@@ -1548,21 +1616,22 @@ def fit_all(X_tr, y_r, y_c, X_te, weights_tr=None, model_weights=None, use_mlp=T
     pc_list.append(("xgb", np.asarray(xc.predict_proba(X_te)[:,1])))
 
     if LGBM:
-        # LightGBM 早停 + 样本权重
+        # LightGBM 回归
         lr = make_lgbm("reg")
         lr.set_params(n_estimators=500)
         lr.fit(X_t, y_rt,
                eval_set=[(X_v, y_rv)],
-               sample_weight=sw_t,  # 传入权重
+               sample_weight=sw_t,
                callbacks=[lgb.early_stopping(20, verbose=False),
                           lgb.log_evaluation(-1)])
 
+        # ★ 改进方案A：LightGBM 分类器增强
         lc = make_lgbm("cls", pos_w)
         lc.set_params(n_estimators=500)
         lc.fit(X_t, y_ct,
                eval_set=[(X_v, y_cv)],
-               sample_weight=sw_t,  # 传入权重
-               callbacks=[lgb.early_stopping(20, verbose=False),
+               sample_weight=sw_t,
+               callbacks=[lgb.early_stopping(30, verbose=False),  # ↑ 从 20 → 30
                           lgb.log_evaluation(-1)])
 
         pr_list.append(("lgbm", np.asarray(lr.predict(X_te))))
@@ -1573,10 +1642,16 @@ def fit_all(X_tr, y_r, y_c, X_te, weights_tr=None, model_weights=None, use_mlp=T
         # 注意：PyTorch DataLoader 原生不支持直接传 sample_weight，需要改写 Loss 函数。
         # 为了保持架构简洁，权重衰减目前主要作用于主导特征分裂的 XGB/LGBM 树模型。
         X_tr_mlp, X_te_mlp = _prepare_mlp_features(X_tr, X_te, winsor_pct=0.01)
-        pr_list.append(("mlp", np.asarray(pred_mlp(train_mlp(X_tr_mlp, y_r, "reg", epochs=mlp_epochs),
-                                        X_te_mlp, "reg"))))
-        pc_list.append(("mlp", np.asarray(pred_mlp(train_mlp(X_tr_mlp, y_c, "cls", epochs=mlp_epochs),
-                                        X_te_mlp, "cls"))))
+        
+        # ★ 优化方案2：保存 MLP 模型用于后续 MC Dropout
+        mlp_r = train_mlp(X_tr_mlp, y_r, "reg", epochs=mlp_epochs)
+        mlp_c = train_mlp(X_tr_mlp, y_c, "cls", epochs=mlp_epochs)
+        
+        # 对集成使用快速推理（mc_samples=1）
+        pr_list.append(("mlp", np.asarray(pred_mlp(mlp_r, X_te_mlp, "reg", mc_samples=1, return_var=False))))
+        pc_list.append(("mlp", np.asarray(pred_mlp(mlp_c, X_te_mlp, "cls", mc_samples=1, return_var=False))))
+    else:
+        mlp_r = mlp_c = None
 
     n = len(pr_list)
     w = (np.array(model_weights[:n])/sum(model_weights[:n])
@@ -1589,9 +1664,18 @@ def fit_all(X_tr, y_r, y_c, X_te, weights_tr=None, model_weights=None, use_mlp=T
         ens_r = ens_r + w[i] * np.asarray(pr)
     for i, (_, pc) in enumerate(pc_list):
         ens_c = ens_c + w[i] * np.asarray(pc)
-    ens   = ens_r*0.5 + ens_c*0.5
+    
+    # ★ 改进方案A：分类器权重提升（从 0.5 → 0.7）
+    # 原理：改进后的分类器通过 aucpr 和激进参数，识别能力更强
+    #       分类器的概率输出本身就是相对排序信号 P(Top20%)
+    #       因此应该给予更高的权重
+    ens   = ens_r*0.3 + ens_c*0.7  # ← 分类器权重 70%，回归 30%
 
-    return ens_r, ens_c, ens, xr, dict(pr_list), dict(pc_list)
+    # ★ 优化方案2：返回 MLP 模型及其特征也供黑-小伯曼使用
+    return ens_r, ens_c, ens, xr, dict(pr_list), dict(pc_list), {
+        "mlp_r": mlp_r, "mlp_c": mlp_c,
+        "X_te_mlp": X_te_mlp if (TORCH and len(X_tr) > 128 and use_mlp) else None
+    }
 
 # ══════════════════════════════════════════════════════════════════
 # 5. Walk-Forward
@@ -1649,30 +1733,52 @@ def walk_forward(panel, tx_cost=0.002):
             continue
 
         # 传入 weights_tr
-        ens_r, ens_c, ens, _, pr_d, pc_d = fit_all(
+        ens_r, ens_c, ens, _, pr_d, pc_d, _ = fit_all(
             X_tr, tr["next_ret"].values, tr["label"].values, X_te, 
             weights_tr=w_tr, model_weights=mw, use_mlp=False)
 
-        # 持仓惯性加成（Walk-Forward 也用）
-        hold_b = CONSTRAINTS.get("hold_bonus", 0.05)
-        if prev_h and hold_b > 0:
-            tix_wf = [idx[1] for idx in te.index]
-            for ji, t in enumerate(tix_wf):
-                if t in prev_h:
-                    ens[ji] += hold_b
+        # ─── 【新增】应用换仓缓冲带（替代旧的持仓惯性加成 + 换仓上限逻辑）───
+        tix_wf = [idx[1] for idx in te.index]
+        
+        # 构建临时 DataFrame 用于缓冲带逻辑
+        temp_df = pd.DataFrame({
+            "ensemble_score": ens
+        }, index=pd.MultiIndex.from_arrays([
+            [dates[i]] * len(te),
+            tix_wf
+        ], names=["date", "ticker"]))
+        
+        # 应用缓冲带
+        prev_holdings_list = list(prev_h) if prev_h else []
+        temp_df_selected = apply_rebalancing_band(
+            current_ranked_df=temp_df,
+            prev_holdings=prev_holdings_list,
+            top_n=TOP_N,
+            rank_buffer=CONSTRAINTS.get("rank_buffer", 25),
+            score_tolerance=CONSTRAINTS.get("score_tolerance", 0.02)
+        )
+        
+        # 从缓冲带结果提取最终的持仓索引
+        selected_tickers = (temp_df_selected.index.get_level_values("ticker").tolist()
+                           if isinstance(temp_df_selected.index, pd.MultiIndex)
+                           else temp_df_selected.index.tolist())
+        
+        # 记录缓冲带保留情况（仅在首次或变化时打印）
+        if i == MIN_TRAIN:
+            kept_from_prev = len(set(selected_tickers) & set(prev_holdings_list))
+            print(f"  💾 缓冲带首次激活：保留 {kept_from_prev} 支老持仓，新增 {len(selected_tickers) - kept_from_prev} 支")
 
-        # 换仓上限（Walk-Forward）
-        max_turn = CONSTRAINTS.get("max_turnover", TOP_N)
+        # 旧逻辑备份（注释掉，但保留以便调试）
+        # hold_b = CONSTRAINTS.get("hold_bonus", 0.05)
+        # if prev_h and hold_b > 0:
+        #     for ji, t in enumerate(tix_wf):
+        #         if t in prev_h:
+        #             ens[ji] += hold_b
+
+        # 从选中的 Ticker 映射回原始索引
         sorted_idx = np.argsort(ens)[::-1]
-        tix_wf     = [idx[1] for idx in te.index]
-        if prev_h and max_turn < TOP_N:
-            kept_idx = [j for j in sorted_idx if tix_wf[j] in prev_h][:TOP_N]
-            new_idx  = [j for j in sorted_idx if tix_wf[j] not in prev_h][:max_turn]
-            comb     = kept_idx + new_idx
-            remaining= [j for j in sorted_idx if j not in comb]
-            final_idx = (comb + remaining)[:TOP_N]
-        else:
-            final_idx = list(sorted_idx[:TOP_N])
+        final_idx = [j for j in sorted_idx if tix_wf[j] in selected_tickers][:TOP_N]
+        
         # OPT1: 矿业子行业硬上限 + OPT5: 冷静期过滤
         max_gold = CONSTRAINTS.get("max_gold_mining", 99)
         max_base = CONSTRAINTS.get("max_base_metals", 99)
@@ -2019,10 +2125,150 @@ def evaluate(wf):
     print(f"    平均月换仓成本            {monthly_turn.mean():.3f}%")
 
 # ══════════════════════════════════════════════════════════════════
-# 6. 当月预测
+# 6. 当月预测 + 投机过滤 + 因子中性化
 # ══════════════════════════════════════════════════════════════════
 
-def predict_now(panel, daily_map, meta_df, wf=None, macro_df=None):
+def check_speculative_hype(ticker, daily_map, surprise_df):
+    """
+    判断逻辑：过去1个月涨幅 > 20% 且 没财报利好
+    
+    定义"无业绩支撑的炒作"：
+      - 1个月涨幅 > 20% (市场炒作信号)
+      - 最近财报未超预期 (surprise_dir <= 0)
+    
+    返回 True 表示该股应被剔除
+    """
+    if ticker not in daily_map: 
+        return False
+    
+    df = daily_map[ticker]
+    if len(df) < 22: 
+        return False  # 至少一个月数据
+    
+    # 计算过去22个交易日涨幅
+    try:
+        mom_1m = (float(df['close'].iloc[-1]) / float(df['close'].iloc[-22])) - 1
+    except (TypeError, IndexError):
+        return False
+    
+    # 获取财报惊喜 (surprise_dir > 0 才有业绩利好)
+    surprise_dir = 0
+    if surprise_df is not None and ticker in surprise_df.index:
+        try:
+            surprise_dir = int(surprise_df.loc[ticker, "surprise_dir"])
+        except (KeyError, IndexError):
+            surprise_dir = 0
+    
+    # 炒作定义：涨幅超20% 且 业绩未超预期 (<=0)
+    is_hype = mom_1m > 0.20 and surprise_dir <= 0
+    return is_hype
+
+
+def get_defensive_replacements(panel, current_pick_tickers, count=3):
+    """
+    寻找防御性替补：从全量面板中（除去已选股票）找 Defensive 风格的股票。
+    
+    参数：
+      panel: 完整面板 (date, ticker) MultiIndex
+      current_pick_tickers: 已选择的 ticker 列表
+      count: 需要找多少支替补
+    
+    返回：替补候选的 (date, ticker) 索引列表，按 ensemble_score 降序排列
+    """
+    # 获取当月所有股票
+    all_tix = panel.index.get_level_values("ticker").unique()
+    
+    # 筛选未被选中的防御性股票
+    defensive_candidates = []
+    for t in all_tix:
+        if t not in current_pick_tickers:
+            profile = STOCK_PROFILE.get(t, {})
+            if profile.get("type") == "Defensive":
+                # 收集所有日期中该股票的最新记录
+                try:
+                    latest_date = panel.index.get_level_values("date").max()
+                    if (latest_date, t) in panel.index:
+                        defensive_candidates.append((latest_date, t))
+                except (KeyError, IndexError):
+                    pass
+    
+    # 按 ensemble_score 降序排列，返回前 count 支
+    if defensive_candidates:
+        scores = [panel.loc[idx, "ensemble_score"] if "ensemble_score" in panel.columns else 0 
+                  for idx in defensive_candidates]
+        sorted_indices = sorted(zip(defensive_candidates, scores), key=lambda x: x[1], reverse=True)
+        return [idx for idx, _ in sorted_indices[:count]]
+    
+    return []
+
+def apply_rebalancing_band(current_ranked_df, prev_holdings, top_n=10, rank_buffer=25, score_tolerance=0.02):
+    """
+    换仓缓冲带：降低换手率，保护 Alpha 不被手续费反噬。
+    
+    双重缓冲逻辑：
+      1. 排名缓冲（Rank Buffer）：如果老持仓掉出前10名，但仍在前25名以内，不踢出去
+      2. 分数缓冲（Score Tolerance）：如果老持仓与第10名的分数差额小于0.02，说明潜力相近，保留
+    
+    参数：
+      current_ranked_df   → 当月排序好的预测结果 (按 ensemble_score 降序)
+      prev_holdings       → 上个月的持仓股票列表 (Ticker 列表)
+      top_n              → 目标持仓数 (默认10)
+      rank_buffer         → 排名容忍范围 (默认25)
+      score_tolerance     → 分数容忍差值 (默认0.02)
+    
+    返回：保留或新增的股票 DataFrame，仍按 ensemble_score 降序排列
+    """
+    if not prev_holdings or len(prev_holdings) == 0:
+        # 无上月持仓，直接返回前 top_n
+        return current_ranked_df.head(top_n) if len(current_ranked_df) >= top_n else current_ranked_df
+    
+    # 提取 Ticker 信息（支持 MultiIndex 和普通 Index）
+    if isinstance(current_ranked_df.index, pd.MultiIndex):
+        current_tickers = current_ranked_df.index.get_level_values("ticker")
+    else:
+        current_tickers = current_ranked_df.index
+    
+    # 获取第 top_n 名（"守门员"）的分数作为基准线
+    if len(current_ranked_df) >= top_n:
+        cutoff_score = current_ranked_df.iloc[top_n - 1]["ensemble_score"]
+    else:
+        cutoff_score = current_ranked_df["ensemble_score"].min() if len(current_ranked_df) > 0 else 0
+    
+    # 构建本月的"安全区"股票池：前 rank_buffer 名，或分数距离第10名不超过 score_tolerance
+    safe_zone_tickers = []
+    for rank, (idx, row) in enumerate(current_ranked_df.iterrows()):
+        ticker = idx[1] if isinstance(idx, tuple) else idx
+        score = row["ensemble_score"]
+        
+        # 【核心逻辑】在排名或分数上在安全区内
+        if rank < rank_buffer or score >= (cutoff_score - score_tolerance):
+            safe_zone_tickers.append(ticker)
+    
+    new_picks = []
+    
+    # Step 1：优先保留老持仓（只要还在安全区，就不卖）
+    for t in prev_holdings:
+        if t in safe_zone_tickers:
+            new_picks.append(t)
+    
+    # Step 2：从本月真正的前 top_n 名补充新股（不能重复）
+    for idx, row in current_ranked_df.iterrows():
+        t = idx[1] if isinstance(idx, tuple) else idx
+        if len(new_picks) >= top_n:
+            break
+        if t not in new_picks:
+            new_picks.append(t)
+    
+    # Step 3：提取最终 DataFrame 并按分数降序排列
+    if isinstance(current_ranked_df.index, pd.MultiIndex):
+        mask = current_ranked_df.index.get_level_values('ticker').isin(new_picks)
+    else:
+        mask = current_ranked_df.index.isin(new_picks)
+    
+    final_df = current_ranked_df[mask].sort_values("ensemble_score", ascending=False)
+    return final_df
+
+def predict_now(panel, daily_map, meta_df, wf=None, macro_df=None, current_holdings=None):
     dates = sorted(panel.index.get_level_values("date").unique())
     sc    = StandardScaler()
 
@@ -2064,7 +2310,8 @@ def predict_now(panel, daily_map, meta_df, wf=None, macro_df=None):
     mw = [1.2, 1.0, 0.8] if LGBM and TORCH else None
     
     # 最终选股：使用完整模型（含 MLP，更精确）
-    ens_r, ens_c, ens, xgb_r, _, _ = fit_all(
+    # ★ 优化方案2：捕获 MLP 模型用于后续 MC Dropout
+    ens_r, ens_c, ens, xgb_r, _, _, mlp_info = fit_all(
         X_tr, tr["next_ret"].values, tr["label"].values, X_cu, 
         weights_tr=w_tr, model_weights=mw, use_mlp=True, mlp_epochs=80)
 
@@ -2076,6 +2323,80 @@ def predict_now(panel, daily_map, meta_df, wf=None, macro_df=None):
     out["name"]   = tix.map(meta_df["name"].to_dict())
     out["sector"] = tix.map(meta_df["sector"].to_dict())
     out = out.sort_values("ensemble_score", ascending=False)
+    
+    # ★ Plan 2: 从 MLP 模型提取 MC Dropout 不确定性
+    mc_dropout_variance = {}
+    if mlp_info and mlp_info.get("mlp_c") is not None and mlp_info.get("X_te_mlp") is not None:
+        try:
+            import torch
+            X_te_mlp = mlp_info["X_te_mlp"]
+            mlp_c = mlp_info["mlp_c"]
+            n_samples = X_te_mlp.shape[0]
+            
+            X_tensor = torch.tensor(X_te_mlp, dtype=torch.float32).to(
+                next(mlp_c.parameters()).device
+            )
+            # MC Dropout: 50 次前向传递，每次打开 dropout
+            preds_mc = []
+            with torch.no_grad():
+                mlp_c.eval()
+                for mc_iter in range(50):
+                    # 临时启用 dropout
+                    for m in mlp_c.modules():
+                        if isinstance(m, torch.nn.Dropout):
+                            m.train()
+                    
+                    out_mc = mlp_c(X_tensor)  # Shape: (n_samples,) or (n_samples, 2) or (n_samples, 1)
+                    
+                    # 检查输出形状并处理
+                    if out_mc.ndim == 1:
+                        # 输出是 sigmoid (n_samples,)，保持原样
+                        preds_mc.append(out_mc.cpu().numpy())
+                    elif out_mc.shape[-1] == 2:
+                        # 输出是 logits (n_samples, 2)，取 softmax 的第1类
+                        preds_mc.append(torch.softmax(out_mc, dim=1)[:, 1].cpu().numpy())
+                    elif out_mc.shape[-1] == 1:
+                        # 输出是 sigmoid (n_samples, 1)，压扁
+                        preds_mc.append(out_mc.squeeze(-1).cpu().numpy())
+                    else:
+                        # 其他情况，取第一列或全部
+                        if out_mc.shape[0] == n_samples:
+                            preds_mc.append(out_mc[:, 0].cpu().numpy() if out_mc.ndim > 1 else out_mc.cpu().numpy())
+                
+                if not preds_mc:
+                    raise ValueError("MC Dropout 未能生成任何预测")
+                
+                # 将所有预测转为 numpy 数组 (mc_samples, n_samples)
+                preds_mc = np.array(preds_mc)
+                
+                # 验证形状
+                if preds_mc.shape[0] < 50:
+                    print(f"    ⚠️ MC Dropout 只收集了 {preds_mc.shape[0]}/50 次采样")
+                if preds_mc.shape[1] != n_samples:
+                    print(f"    ⚠️ 采样数 {preds_mc.shape[1]} ≠ 样本数 {n_samples}，尝试修正...")
+                    # 如果形状不匹配，舍弃MC Dropout
+                    raise ValueError(f"形状不匹配：预测 {preds_mc.shape} vs 样本 {n_samples}")
+                
+                # 计算方差 (n_samples,)
+                pred_var = preds_mc.var(axis=0)
+            
+            # 映射回 ticker
+            n_mapped = 0
+            for i, idx in enumerate(out.index):
+                t = idx[1] if isinstance(idx, tuple) else idx
+                if i < len(pred_var):
+                    mc_dropout_variance[t] = float(pred_var[i])
+                    n_mapped += 1
+            
+            if n_mapped == len(out):
+                print(f"  ✅ MC Dropout 不确定性：{n_mapped}/{len(out)} 支股票方差已计算")
+            else:
+                print(f"  ⚠️  MC Dropout 方差不完整：{n_mapped}/{len(out)} 支")
+        except Exception as e:
+            import traceback
+            print(f"  ⚠️  MC Dropout 方差提取失败：{str(e)}")
+            # 不预期出现详细traceback，仅在调试时显示
+            # traceback.print_exc()
 
     # 最终价格过滤（双重保障：apply_constraints 之后 predict_now 里再过滤一次）
     max_px = CONSTRAINTS.get("max_price_cad", 9999)
@@ -2088,6 +2409,16 @@ def predict_now(panel, daily_map, meta_df, wf=None, macro_df=None):
     if len(filtered_out):
         print(f"  价格过滤：剔除 {list(filtered_out.index.get_level_values('ticker') if isinstance(filtered_out.index, pd.MultiIndex) else filtered_out.index)}")
     out = out[price_mask]
+
+    # --- [新增] 预过滤：投机炒作检测 ---
+    # 定义：过去1个月涨幅 > 20% 且 没有财报利好支撑
+    if not out.empty:
+        tix_current = out.index.get_level_values("ticker") if isinstance(out.index, pd.MultiIndex) else out.index
+        speculative_tickers = [t for t in tix_current 
+                               if check_speculative_hype(t, daily_map, None)]  # surprise_df 可后续注入
+        if speculative_tickers:
+            print(f"  🛑 剔除无业绩支撑的炒作股（1m涨幅>20%）：{speculative_tickers}")
+            out = out[~out.index.get_level_values("ticker").isin(speculative_tickers)]
 
     # OPT6: 置信度过滤 - 低置信度时减少持仓数
     min_conf   = CONSTRAINTS.get("min_confidence", 0.0)
@@ -2132,6 +2463,83 @@ def predict_now(panel, daily_map, meta_df, wf=None, macro_df=None):
     out = out.loc[keep]
     print(f"  分散后：{len(out)} 支  {dict(gc)}"
           f"  [黄金:{gold_cnt}/{max_gold} 贱金属:{base_cnt}/{max_base}]")
+
+    # ─── 【新增】应用换仓缓冲带（降低换手率）───────────────────
+    if current_holdings and len(current_holdings) > 0:
+        print(f"  💾 检测到上月持仓 ({len(current_holdings)} 支)，应用换仓缓冲带...")
+        out_before = len(out)
+        
+        # 应用缓冲带逻辑
+        out = apply_rebalancing_band(
+            current_ranked_df=out,
+            prev_holdings=current_holdings,
+            top_n=TOP_N,
+            rank_buffer=CONSTRAINTS.get("rank_buffer", 25),
+            score_tolerance=CONSTRAINTS.get("score_tolerance", 0.02)
+        )
+        
+        # 统计保留了多少老持仓
+        out_tix = out.index.get_level_values("ticker") if isinstance(out.index, pd.MultiIndex) else out.index
+        kept_from_prev = len(set(out_tix) & set(current_holdings))
+        print(f"  ✓ 缓冲带：保留 {kept_from_prev} 支老持仓，新增 {len(out) - kept_from_prev} 支，总计 {len(out)} 支")
+
+    # --- [新增] 后处理：因子中性化与防御性替换 ---
+    # 检测集中度过高的因子：高波动 + 能源
+    # 定义：vol_1m > 0.40 (40% 年化波动) 或 GICS=Energy
+    if not out.empty:
+        out_tix = out.index.get_level_values("ticker") if isinstance(out.index, pd.MultiIndex) else out.index
+        
+        high_vol_tickers = []
+        energy_tickers = []
+        
+        for t in out_tix:
+            profile = STOCK_PROFILE.get(t, {})
+            
+            # 检查是否高波动
+            try:
+                vol_1m = float(out.loc[(slice(None), t), "vol_1m"].iloc[0]) if isinstance(out.index, pd.MultiIndex) else float(out.loc[t, "vol_1m"])
+                if vol_1m > 0.40:
+                    high_vol_tickers.append(t)
+            except (KeyError, IndexError, TypeError):
+                pass
+            
+            # 检查是否能源
+            if profile.get("gics") == "Energy":
+                energy_tickers.append(t)
+        
+        concentrated_group = set(high_vol_tickers) | set(energy_tickers)
+        
+        # 如果集中度过高（Top 10 中有 6 个是高风险因子），执行中性化
+        if len(concentrated_group) >= 6 and len(out) >= TOP_N:
+            print(f"  ⚠️  因子集中度过高 ({len(concentrated_group)} 支 Energy/HighVol)，执行中性化...")
+            
+            # 找到要替换的倒数 3 支（分数最低）
+            to_remove_indices = out.iloc[-3:].index.tolist()
+            n_remove = len(to_remove_indices)
+            
+            # 寻找防御性替补
+            replacements = get_defensive_replacements(panel, out_tix.tolist(), count=n_remove)
+            
+            if replacements:
+                print(f"  🔄 用 {len(replacements)} 支防御性品种替换高风险股")
+                
+                # 移除倒数 N 支
+                out = out.drop(to_remove_indices)
+                
+                # 添加替补（赋予当前平均分数，确保排序合理）
+                avg_score = out["ensemble_score"].mean()
+                for rep_idx in replacements:
+                    if rep_idx not in out.index and rep_idx in panel.index:
+                        try:
+                            out = pd.concat([out, panel.loc[[rep_idx]]])
+                            # 更新替补的 ensemble_score 为平均值，保持排序合理
+                            out.loc[rep_idx, "ensemble_score"] = avg_score
+                        except Exception as e:
+                            print(f"    ⚠️  添加替补 {rep_idx} 失败：{e}")
+                
+                # 重新排序
+                out = out.sort_values("ensemble_score", ascending=False)
+                print(f"  ✓ 中性化后：{len(out)} 支 (Energy/HighVol 占比：{len(concentrated_group)/len(out)*100:.0f}%)")
 
     imp = pd.Series(xgb_r.feature_importances_,
                     index=FEATURE_COLS).sort_values(ascending=False)
@@ -3351,7 +3759,8 @@ def apply_earnings_signal(result: pd.DataFrame, surprise_df: pd.DataFrame,
 def black_litterman_weights(top: pd.DataFrame, daily_map: dict,
                              meta_df: pd.DataFrame,
                              risk_aversion: float = 2.5,
-                             prev_weights: dict = None) -> pd.DataFrame:
+                             prev_weights: dict = None,
+                             pred_variance: dict = None) -> pd.DataFrame:
     """
     用 Black-Litterman 模型替换 Fuzzy 仓位分配。
 
@@ -3363,8 +3772,14 @@ def black_litterman_weights(top: pd.DataFrame, daily_map: dict,
 
     参数：
       risk_aversion: 风险厌恶系数（越高越保守，一般2-4）
+      prev_weights:  上期持仓权重，用于换仓感知优化
+      pred_variance: MC Dropout 预测不确定性（方差），用于动态调整观点置信度
 
     输出：每支股票的最优仓位比例（合计100%）
+    
+    ★ Plan 2: 融入 MC Dropout 不确定性
+      - pred_variance 中高方差 → 观点置信度降低
+      - 相当于在高不确定性资产上下注更少、权重更低
     """
     try:
         from pypfopt import BlackLittermanModel, risk_models, expected_returns
@@ -3449,11 +3864,24 @@ def black_litterman_weights(top: pd.DataFrame, daily_map: dict,
         views[t] = float(np.clip(ic_proxy * sigma * float(z_scores[j]), -0.15, 0.15))
 
     # ── 5. 观点置信度 ─────────────────────────────────────────────
+    # ★ Plan 2: 融入模型不确定性（MC Dropout方差）
     confidences = {}
     for idx, row in top.iterrows():
         t    = idx[1] if isinstance(idx, tuple) else idx
         prob = row.get("pred_top20pct", 0.5)
-        confidences[t] = float(np.clip(prob, 0.3, 0.9))
+        
+        # 如果有MC Dropout方差，融入不确定性
+        confidence = prob  # 默认使用分类概率
+        if pred_variance and t in pred_variance:
+            variance = float(pred_variance.get(t, 0.0))
+            # 检查方差是否有效（不是 NaN 或无穷大）
+            if np.isfinite(variance) and variance >= 0:
+                # variance × 0.7 权重 + 分类概率 × 0.3 权重
+                # 低方差(确定) → 置信度高; 高方差(不确定) → 置信度低
+                uncertainty_adj = np.exp(-np.clip(variance * 2.0, -10, 10))  # 防止数值溢出
+                confidence = 0.7 * float(prob) + 0.3 * uncertainty_adj
+        
+        confidences[t] = float(np.clip(confidence, 0.3, 0.9))
 
     # ── 6. Black-Litterman 模型 ───────────────────────────────────
     try:
@@ -3469,9 +3897,20 @@ def black_litterman_weights(top: pd.DataFrame, daily_map: dict,
 
         # 用 BL 后验收益做均值方差优化
         bl_returns = bl.bl_returns()
-        ef = EfficientFrontier(bl_returns, S)
+        
+        # ★ 修复角点解（强制分散）：
+        # 1. 硬性边界：单只股票最低 2%，最高 15%（防止极端集中）
+        ef = EfficientFrontier(bl_returns, S, weight_bounds=(0.02, 0.15))
+        
+        # 2. 软性约束（L2 正则化）：强迫权重平滑分散
+        #    gamma 越大权重越趋向等权。0.1 是平衡点（对应 ~15% 权重即使 score 最高）
+        try:
+            from pypfopt import objective_functions
+            ef.add_objective(objective_functions.L2_reg, gamma=0.1)
+        except Exception as e:
+            print(f"  ⚠️  L2 正则化加载失败（{e}），继续优化但权重分散效果降低")
 
-        # OPT C: Turnover-Aware 优化
+        # 3. 交易成本惩罚（如果有上期权重）
         # ✓ Bug fix: prev_weights 参数正确传入且有效使用（对齐上期权重，做换仓感知优化）
         w_prev = None
         if prev_weights and cp is not None:
@@ -3482,26 +3921,33 @@ def black_litterman_weights(top: pd.DataFrame, daily_map: dict,
                 w_prev = w_prev_arr / total_prev
 
         if w_prev is not None and cp is not None:
-            # 换仓惩罚：双边手续费 0.4%（买入0.2% + 卖出0.2%）
-            # 优化器会权衡：换仓收益 vs 0.4% * 换仓量
+            # 换仓惩罚：双边手续费 0.2%（有边界+L2后，换仓天生就被抑制，所以惩罚较轻）
+            # 优化器会权衡：换仓收益 vs 0.2% * 换仓量
             try:
-                from pypfopt import objective_functions
                 ef.add_objective(
                     objective_functions.transaction_cost,
-                    w_prev=w_prev, k=0.004
+                    w_prev=w_prev, k=0.002
                 )
                 ef.max_sharpe(risk_free_rate=0.04/12)
                 weights = ef.clean_weights()
                 turnover = float(np.abs(
                     np.array(list(weights.values())) - w_prev).sum())
-                print(f"  BL 换仓感知：换仓量 {turnover*100:.1f}%（含成本惩罚）")
-            except Exception:
+                print(f"  BL 最优仓位：边界约束[2%-15%] + L2 正则化 + 换仓成本")
+                print(f"  换仓量 {turnover*100:.1f}%（含成本惩罚）")
+            except Exception as e_opt:
+                print(f"  ⚠️  交易成本优化失败（{e_opt}），使用标准最优解")
                 ef.max_sharpe(risk_free_rate=0.04/12)
                 weights = ef.clean_weights()
         else:
-            # 首次运行 / cvxpy 未装 / 无上期权重：标准 max_sharpe
-            ef.max_sharpe(risk_free_rate=0.04/12)
-            weights = ef.clean_weights()
+            # 首次运行 / cvxpy 未装 / 无上期权重：标准 max_sharpe（含边界+L2）
+            try:
+                ef.max_sharpe(risk_free_rate=0.04/12)
+                weights = ef.clean_weights()
+                print(f"  BL 最优仓位：边界约束[2%-15%] + L2 正则化（首次运行）")
+            except Exception as e_sharpe:
+                print(f"  ⚠️  Sharpe 优化失败（{e_sharpe}），使用最小波动率替代")
+                ef.min_volatility()
+                weights = ef.clean_weights()
 
     except Exception as e:
         print(f"  ⚠️  BL 优化失败：{e}，使用等风险权重")
@@ -4017,28 +4463,47 @@ def run_new_modules(panel, daily_map, meta_df, macro_df, wf,
     print(f"  约束调整：{regime_constraints}")
 
     # ── F. Earnings Surprise ──────────────────────────────────────
-    print("\n【F】Earnings Surprise（盈利惊喜）")
-    passed_tickers = (result.index.get_level_values("ticker").tolist()
-                      if isinstance(result.index, pd.MultiIndex)
-                      else result.index.tolist())
+    print("\n【F】Earnings Surprise（盈利惊喜）& DML 因果调整")
+    
+    # ★ 修复：提前提取信号，避免样本不足
+    # 1. 先从所有候选中取前 60 支作为宽泛候选池（DML 需要足够样本）
+    broad_pool_size = max(60, TOP_N * 6)  # 至少是 TOP_N 的 6 倍
+    broad_candidates = result.nlargest(broad_pool_size, "ensemble_score") if hasattr(result, 'nlargest') else result.head(broad_pool_size)
+    broad_tickers = (broad_candidates.index.get_level_values("ticker").tolist()
+                     if isinstance(broad_candidates.index, pd.MultiIndex)
+                     else broad_candidates.index.tolist())
+    
+    print(f"  [前置] 从 {len(result)} 支所有候选中取前 {len(broad_tickers)} 支作为 DML 样本池")
+    
+    # 2. 获取财报惊喜
     surprise_df = pd.DataFrame()
     try:
-        surprise_df = fetch_earnings_surprise(passed_tickers[:TOP_N])
-        if result is not None and not surprise_df.empty:
-            # 优先使用 DML 动态估计（同时处理 insider + surprise）
+        surprise_df = fetch_earnings_surprise(broad_tickers)
+        
+        # 3. 运行 DML 因果调整（现在有足够样本了）
+        if not surprise_df.empty:
             print("  [DML] 用双重机器学习估计事件信号的纯因果效应...")
             try:
+                # DML 调整整个 result（不限制到 TOP_N）
                 result = apply_dml_signal(result, panel, insider_df, surprise_df)
                 print("  ✅ DML 动态调整已融入排名（替代固定乘数）")
             except Exception as e_dml:
                 print(f"  ⚠️  DML 失败（{e_dml}），fallback 到固定乘数")
                 result = apply_earnings_signal(result, surprise_df, weight=0.12)
+        else:
+            print("  ⚠️  未获取到财报数据，跳过 DML")
+            
     except Exception as e:
         print(f"  ⚠️  Earnings Surprise 获取失败：{e}")
+    
+    # 4. DML 调整完成后，重新排序 result（分数已被 DML 调整）
+    if result is not None:
+        result = result.sort_values("ensemble_score", ascending=False)
 
     # ── G. Black-Litterman ────────────────────────────────────────
     print("\n【G】Black-Litterman 最优仓位")
     bl_df = pd.DataFrame()
+    mc_dropout_variance = {}  # ✓ 初始化为空字典（预设）
     if result is not None:
         try:
             top = result.head(TOP_N)
@@ -4055,7 +4520,8 @@ def run_new_modules(panel, daily_map, meta_df, macro_df, wf,
                     }
             bl_df = black_litterman_weights(top, daily_map, meta_df,
                                              risk_aversion=2.5,
-                                             prev_weights=prev_bl_weights)
+                                             prev_weights=prev_bl_weights,
+                                             pred_variance=mc_dropout_variance)
             if not bl_df.empty:
                 print_bl_weights(bl_df, regime.regime)
             else:
@@ -4106,7 +4572,7 @@ def run_new_modules(panel, daily_map, meta_df, macro_df, wf,
 BACKTEST_MONTHS  = 12
 INITIAL_CAPITAL  = 100_000
 BENCHMARK        = "XIU.TO"
-BT_TX_COST       = 0.002
+BT_TX_COST       = 0.000   # ★ Wealthsimple 免手续费版本：硬性手续费清零（滑点由bid_ask模拟）
 BT_STOP_LOSS     = -0.08   # 全局止损下限（保底）
 BT_VOL_STOP_MULT = 1.5    # 动态止损 = 个股历史月波动率 × 此倍数
 # 例：月波动率 8% 的矿业股 → 止损 -12%（不被噪音洗盘）
@@ -4398,7 +4864,20 @@ if __name__ == "__main__":
                         stop_loss       = STOP_LOSS_PCT,
                         benchmark       = "XIU.TO")
 
-        result, imp, dd_signal = predict_now(panel, daily_map, meta_df, wf)
+        # 🎯 【新增】：激活实盘换仓缓冲带
+        # 👇 在这里填入你目前券商账户里"真实持有"的股票代码
+        # 每月运行代码前，根据你账户的实际情况更新这个列表
+        # 示例（替换为你的真实持仓）：
+        MY_CURRENT_HOLDINGS = [
+            "BMO.TO", "MFC.TO", "NTR.TO", "EMA.TO", "LUN.TO", 
+            "DIR-UN.TO", "ENGH.TO", "ARX.TO", "CNQ.TO", "FTT.TO"
+        ]
+
+        # 🎯 【修改】：把真实持仓传给 predict_now，激活实盘换仓缓冲带
+        result, imp, dd_signal = predict_now(
+            panel, daily_map, meta_df, wf, macro_df=macro_df,
+            current_holdings=MY_CURRENT_HOLDINGS  # 👈 关键参数：启用缓冲带
+        )
 
         # 高级模块（共线性 / SEDI / 参数敏感性 / 真实回测框架）
         insider_df, feat_cols = run_advanced_analysis(
