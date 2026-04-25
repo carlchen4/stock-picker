@@ -498,6 +498,7 @@ CONSTRAINTS = {
     "dd_halt_scale":      0.50,   # 减仓比例
     "vix_scale_threshold":25.0,   # VIX 高于此值时缩仓
     "vix_scale_factor":   0.70,   # VIX 高时仓位缩至 70%
+    "min_listing_days":   252,
 }
 
 # 矿业子行业分类（OPT1 用）
@@ -517,6 +518,7 @@ FEATURE_COLS = [
     # 财报日历特征（新）
     "days_to_earnings",    # 距下次财报天数（负=财报刚过）
     "days_since_earnings", # 距上次财报天数（PEAD窗口）
+    "bb_zscore",
 ]
 
 # ══════════════════════════════════════════════════════════════════
@@ -838,6 +840,10 @@ def apply_constraints(daily_map, meta_df, c):
 
     for t, df in daily_map.items():
         reasons = []
+        min_days = c.get("min_listing_days", 0)
+        if len(df) < min_days:
+            reasons.append(f"上市时间 {len(df)} 天 < {min_days} 天")
+
         m = meta_df.loc[t] if t in meta_df.index else pd.Series(dtype=float)
         price = df["close"].iloc[-1]
 
@@ -936,7 +942,9 @@ def compute_pit_fundamentals(pit_df, monthly_close):
     （保持原函数名，无缝接入 build_panel）
     """
     if pit_df.empty or monthly_close.empty:
-        return pd.DataFrame(index=monthly_close.index, columns=["pe","pb","roe","eps_growth","fcf_yield"])
+        result = pd.DataFrame(index=monthly_close.index, columns=["pe","pb","roe","eps_growth","fcf_yield"])
+        result.index.name = "date"
+        return result
 
     pit_df = pit_df.sort_values('avail_date').copy()
     pit_df['ttm_ni'] = pit_df['net_income'].rolling(4, min_periods=4).sum()
@@ -951,6 +959,9 @@ def compute_pit_fundamentals(pit_df, monthly_close):
     left_df = monthly_close.reset_index()
     if 'index' in left_df.columns:
         left_df = left_df.rename(columns={'index': 'date'})
+    elif left_df.columns[0] not in ['date', 'close']:
+        # If first column is unnamed or has a default name, rename it to 'date'
+        left_df = left_df.rename(columns={left_df.columns[0]: 'date'})
     left_df = left_df.rename(columns={'close': 'price'})
     left_df = left_df.sort_values('date')
     right_df = pit_df.reset_index().sort_values('avail_date')
@@ -965,7 +976,9 @@ def compute_pit_fundamentals(pit_df, monthly_close):
     required_cols = [c for c in merge_cols if c in merged.columns]
     
     if len(required_cols) < 3:  # Need at least 3 of 5 columns to compute ratios
-        return pd.DataFrame(index=monthly_close.index, columns=["pe","pb","roe","eps_growth","fcf_yield"])
+        result = pd.DataFrame(index=monthly_close.index, columns=["pe","pb","roe","eps_growth","fcf_yield"])
+        result.index.name = "date"
+        return result
     
     merged['pe'] = merged['price'] / (merged['ttm_ni'] / merged['shares']).replace(0, np.nan)
     merged['pb'] = merged['price'] / (merged['total_equity'] / merged['shares']).replace(0, np.nan)
@@ -974,8 +987,12 @@ def compute_pit_fundamentals(pit_df, monthly_close):
     
     merged.replace([np.inf, -np.inf], np.nan, inplace=True)
     if 'date' not in merged.columns:
-        return pd.DataFrame(index=monthly_close.index, columns=["pe","pb","roe","eps_growth","fcf_yield"])
-    return merged.set_index('date')[['pe', 'pb', 'roe', 'eps_growth', 'fcf_yield']]
+        result = pd.DataFrame(index=monthly_close.index, columns=["pe","pb","roe","eps_growth","fcf_yield"])
+        result.index.name = "date"
+        return result
+    result = merged.set_index('date')[['pe', 'pb', 'roe', 'eps_growth', 'fcf_yield']]
+    result.index.name = "date"
+    return result
 
 
 def compute_monthly_tech(df):
@@ -994,13 +1011,18 @@ def compute_monthly_tech(df):
     vwapb = (mc-mvwap)/mvwap
     h52   = (c/c.rolling(252).max()).resample("ME").last()
     rsi_m = _rsi(c).resample("ME").last()
-    return pd.DataFrame({
+    bb_zscore = ((c - c.rolling(20).mean()) / c.rolling(20).std()).resample("ME").last()
+
+    result = pd.DataFrame({
         "close":mc,"mom_1m":m1,"mom_3m":m3,"mom_6m":m6,"mom_12m":m12,
         "mom_12_1":m12-m1,"vol_1m":vol1m,"vol_3m":vol3m,
         "vol_ratio":vol1m/vol3m.replace(0,np.nan),
         "rsi":rsi_m,"bias_20":b20,"bias_60":b60,
         "vwap_bias":vwapb,"price_vs_52w_high":h52,
+        "bb_zscore": bb_zscore,
     }).dropna(subset=["close"])
+    result.index.name = "date"
+    return result
 
 
 def get_macro_feat(macro_df, month_end):
@@ -1177,6 +1199,11 @@ def build_panel(passed, daily_map, pit_map, macro_df):
             fund_block = (fund_hist.reindex(tech.index,method="ffill")[fund_cols]
                           if not fund_hist.empty
                           else pd.DataFrame(np.nan,index=tech.index,columns=fund_cols))
+            
+            # ✓ Bug Fix: Ensure all blocks have the same index name before concat
+            macro_block.index.name = "date"
+            fund_block.index.name = "date"
+            
             block = pd.concat([tech, macro_block, fund_block], axis=1)
             block["ticker"] = t
             block.index.name = "date"
@@ -1184,7 +1211,12 @@ def build_panel(passed, daily_map, pit_map, macro_df):
             earn_feats = compute_earnings_features(t, tech.index, earnings_cal)
             block["days_to_earnings"]    = earn_feats["days_to_earnings"].values
             block["days_since_earnings"] = earn_feats["days_since_earnings"].values
-            rows.append(block.reset_index())
+            
+            # ✓ Bug Fix: Explicitly reset index to 'date' column
+            block = block.reset_index()
+            if "date" not in block.columns:
+                block["date"] = pd.to_datetime(block.index) if hasattr(block.index, '__iter__') else block.index
+            rows.append(block)
         except Exception as e:
             errors.append(f"{t}: {e}")
 
@@ -1368,17 +1400,14 @@ def cross_z(panel: pd.DataFrame) -> pd.DataFrame:
 
 
 def make_xgb(task, pos_w=1.0):
-    """保持原名，但把回归任务偷换成排序任务"""
+    """标准 XGBoost 模型：回归和分类"""
     kw = dict(n_estimators=300, max_depth=3, learning_rate=0.04,
               subsample=0.8, colsample_bytree=0.7,
               reg_alpha=0.5, reg_lambda=1.5, random_state=42, verbosity=0)
               
     if task == "reg":
-        # 原来的 XGBRegressor 被替换为 XGBRanker
-        kw['objective'] = 'rank:pairwise'
-        return xgb.XGBRanker(**kw)
+        return xgb.XGBRegressor(**kw)
     else:
-        # 分类任务保持不变
         return xgb.XGBClassifier(**kw, scale_pos_weight=pos_w, eval_metric="logloss")
 
 
@@ -1477,6 +1506,16 @@ def fit_all(X_tr, y_r, y_c, X_te, weights_tr=None, model_weights=None, use_mlp=T
     第四层：多模型训练 + 动态权重集成。
     ★ 新增 weights_tr 参数，用于传入时间衰减权重。
     """
+    # ✓ Bug Fix: Validate input arrays
+    if len(X_tr) == 0:
+        raise ValueError(f"Training set empty: X_tr.shape={X_tr.shape}")
+    if len(X_te) == 0:
+        raise ValueError(f"Test set empty: X_te.shape={X_te.shape}")
+    if len(y_r) != len(X_tr):
+        raise ValueError(f"Target-feature mismatch: len(y_r)={len(y_r)} vs len(X_tr)={len(X_tr)}")
+    if len(y_c) != len(X_tr):
+        raise ValueError(f"Classification target-feature mismatch: len(y_c)={len(y_c)} vs len(X_tr)={len(X_tr)}")
+    
     pos_w = max((y_c==0).sum()/max((y_c==1).sum(),1), 1.0)
     pr_list, pc_list = [], []
 
@@ -1597,21 +1636,15 @@ def walk_forward(panel, tx_cost=0.002):
         if model_ic:
             mw = [max(0.1, np.mean(v[-3:])) for v in model_ic.values()]
 
+        # ✓ Bug Fix: Ensure X_te is not empty before fitting
+        if len(X_te) == 0:
+            print(f"  ⚠️  月 {i+1} 测试集为空，跳过")
+            continue
+
         # 传入 weights_tr
         ens_r, ens_c, ens, _, pr_d, pc_d = fit_all(
             X_tr, tr["next_ret"].values, tr["label"].values, X_te, 
             weights_tr=w_tr, model_weights=mw, use_mlp=False)
-
-        # 动态模型权重（基于近期 IC）
-        mw = None
-        if model_ic:
-            mw = [max(0.1, np.mean(v[-3:])) for v in model_ic.values()]
-
-        # Walk-Forward: 跳过 MLP（太慢），只用树模型快速评分
-        # 最终 predict_now 会用完整模型（含 MLP）
-        ens_r, ens_c, ens, _, pr_d, pc_d = fit_all(
-            X_tr, tr["next_ret"].values, tr["label"].values, X_te, mw,
-            use_mlp=False)
 
         # 持仓惯性加成（Walk-Forward 也用）
         hold_b = CONSTRAINTS.get("hold_bonus", 0.05)
