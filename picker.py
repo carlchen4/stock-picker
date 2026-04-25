@@ -1252,15 +1252,17 @@ def add_labels(panel):
         ret_resid   = ret_abs - market_mean
 
         # Fix8: 用个股自身历史时序波动率标准化（真正的IR）
-        # 直接从 panel 中提取已计算好的个股年化波动率 (vol_1m)
+        # 直接从 panel 中提取已计算好的个股年化波动率 (vol_1m)，进行月度化处理
         try:
-            annual_vol = panel.xs(date, level="date")["vol_1m"]
-        except KeyError:
-            annual_vol = pd.Series(0.05 * np.sqrt(12), index=common)
-
-        # 年化波动率转为月度波动率：vol / sqrt(12)
-        # 用 fillna(0.05) 兜底缺失值，clip(lower=0.01) 防止除以极小值导致目标值(Label)爆炸
-        monthly_vol = (annual_vol.reindex(common) / np.sqrt(12)).fillna(0.05).clip(lower=0.01)
+            # 提取当月的 vol_1m（年化波动率）
+            vol_1m_current = panel.xs(date, level="date")["vol_1m"]
+            # 转换为月度波动率：annual_vol / sqrt(12)
+            monthly_vol_raw = vol_1m_current / np.sqrt(12)
+            # 取交集中存在的股票，用 0.05 填充缺失，clip 防止极小值
+            monthly_vol = monthly_vol_raw.reindex(common).fillna(0.05).clip(lower=0.01)
+        except (KeyError, AttributeError):
+            # 应急：直接用 0.05 的月度波动率（对应年化 ~17.3%）
+            monthly_vol = pd.Series(0.05, index=common).clip(lower=0.01)
 
         # 向量化计算风险调整后收益
         ret = ret_resid / monthly_vol
@@ -1542,8 +1544,8 @@ def fit_all(X_tr, y_r, y_c, X_te, weights_tr=None, model_weights=None, use_mlp=T
     # 传入 sample_weight=sw_t
     xc.fit(X_t, y_ct, eval_set=[(X_v, y_cv)], sample_weight=sw_t, verbose=False)
 
-    pr_list.append(("xgb", xr.predict(X_te)))
-    pc_list.append(("xgb", xc.predict_proba(X_te)[:,1]))
+    pr_list.append(("xgb", np.asarray(xr.predict(X_te))))
+    pc_list.append(("xgb", np.asarray(xc.predict_proba(X_te)[:,1])))
 
     if LGBM:
         # LightGBM 早停 + 样本权重
@@ -1563,25 +1565,30 @@ def fit_all(X_tr, y_r, y_c, X_te, weights_tr=None, model_weights=None, use_mlp=T
                callbacks=[lgb.early_stopping(20, verbose=False),
                           lgb.log_evaluation(-1)])
 
-        pr_list.append(("lgbm", lr.predict(X_te)))
-        pc_list.append(("lgbm", lc.predict_proba(X_te)[:,1]))
+        pr_list.append(("lgbm", np.asarray(lr.predict(X_te))))
+        pc_list.append(("lgbm", np.asarray(lc.predict_proba(X_te)[:,1])))
 
     if TORCH and len(X_tr) > 128 and use_mlp:
         # MLP 专用：Winsorize + RobustScaler
         # 注意：PyTorch DataLoader 原生不支持直接传 sample_weight，需要改写 Loss 函数。
         # 为了保持架构简洁，权重衰减目前主要作用于主导特征分裂的 XGB/LGBM 树模型。
         X_tr_mlp, X_te_mlp = _prepare_mlp_features(X_tr, X_te, winsor_pct=0.01)
-        pr_list.append(("mlp", pred_mlp(train_mlp(X_tr_mlp, y_r, "reg", epochs=mlp_epochs),
-                                        X_te_mlp, "reg")))
-        pc_list.append(("mlp", pred_mlp(train_mlp(X_tr_mlp, y_c, "cls", epochs=mlp_epochs),
-                                        X_te_mlp, "cls")))
+        pr_list.append(("mlp", np.asarray(pred_mlp(train_mlp(X_tr_mlp, y_r, "reg", epochs=mlp_epochs),
+                                        X_te_mlp, "reg"))))
+        pc_list.append(("mlp", np.asarray(pred_mlp(train_mlp(X_tr_mlp, y_c, "cls", epochs=mlp_epochs),
+                                        X_te_mlp, "cls"))))
 
     n = len(pr_list)
     w = (np.array(model_weights[:n])/sum(model_weights[:n])
          if model_weights and len(model_weights)>=n else np.ones(n)/n)
 
-    ens_r = sum(w[i]*pr for i,(_,pr) in enumerate(pr_list))
-    ens_c = sum(w[i]*pc for i,(_,pc) in enumerate(pc_list))
+    # ✓ Bug Fix: Ensure all predictions are numpy arrays before ensemble averaging
+    ens_r = np.zeros(len(X_te))
+    ens_c = np.zeros(len(X_te))
+    for i, (_, pr) in enumerate(pr_list):
+        ens_r = ens_r + w[i] * np.asarray(pr)
+    for i, (_, pc) in enumerate(pc_list):
+        ens_c = ens_c + w[i] * np.asarray(pc)
     ens   = ens_r*0.5 + ens_c*0.5
 
     return ens_r, ens_c, ens, xr, dict(pr_list), dict(pc_list)
@@ -2028,10 +2035,25 @@ def predict_now(panel, daily_map, meta_df, wf=None, macro_df=None):
         print("训练数据不足（YEARS >= 3）")
         return None, None, None
 
+    # ✓ Bug fix: 检查当月数据是否为空（关键：防止 0 样本错误）
+    if cur.empty:
+        print(f"  ⚠️  当月数据为空（dates[-1]={dates[-1]}）")
+        print(f"     这可能是因为：")
+        print(f"       1. build_panel 过滤掉了所有当月股票")
+        print(f"       2. 当月数据缺失")
+        print(f"     建议：检查 constraints 是否过于严格，或数据是否完整")
+        return None, None, None
+
     print(f"\n训练最终模型（{len(tr)} 行历史）...")
-    # 👇 替换为以下内容 👇
     X_tr = sc.fit_transform(tr[FEATURE_COLS].fillna(tr[FEATURE_COLS].median()))
     X_cu = sc.transform(cur[FEATURE_COLS].fillna(tr[FEATURE_COLS].median()))
+
+    # ✓ Bug fix: 验证 X_cu 是否为空
+    if X_cu.shape[0] == 0:
+        print(f"  ❌ ERROR: 当月特征矩阵为空（X_cu.shape={X_cu.shape}）")
+        print(f"     这不应该发生，因为 cur 已检查非空")
+        print(f"     可能原因：cur[FEATURE_COLS] 返回空 DataFrame")
+        return None, None, None
 
     # ★ 计算最后一次预测的样本时间衰减权重
     sample_dates = tr.index.get_level_values("date")
@@ -2041,17 +2063,10 @@ def predict_now(panel, daily_map, meta_df, wf=None, macro_df=None):
     # 第四层：动态权重
     mw = [1.2, 1.0, 0.8] if LGBM and TORCH else None
     
-    # 最终选股：使用完整模型，并传入 weights_tr
+    # 最终选股：使用完整模型（含 MLP，更精确）
     ens_r, ens_c, ens, xgb_r, _, _ = fit_all(
         X_tr, tr["next_ret"].values, tr["label"].values, X_cu, 
         weights_tr=w_tr, model_weights=mw, use_mlp=True, mlp_epochs=80)
-
-    # 第四层：动态权重
-    mw = [1.2, 1.0, 0.8] if LGBM and TORCH else None
-    # 最终选股：使用完整模型（含 MLP，更精确）
-    ens_r, ens_c, ens, xgb_r, _, _ = fit_all(
-        X_tr, tr["next_ret"].values, tr["label"].values, X_cu, mw,
-        use_mlp=True, mlp_epochs=80)  # 最终选股用80 epochs
 
     out = cur[FEATURE_COLS].copy()
     out["pred_return"]    = ens_r
@@ -3378,10 +3393,16 @@ def black_litterman_weights(top: pd.DataFrame, daily_map: dict,
         print("  ⚠️  价格数据不足，使用 Fuzzy 仓位")
         return pd.DataFrame()
 
-    prices = pd.DataFrame(price_data).ffill().dropna()
-
+    # ✓ Bug fix: 先 tail(252) 截取最近252个交易日（~1年），再填充缺失值
+    # 这样可以避免 dropna() 因为某个次新股数据缺失而删除整个矩阵的问题
+    prices_full = pd.DataFrame(price_data).ffill()  # 先前向填充
+    prices = prices_full.tail(252).dropna()  # 截取最近252日，防止次新股导致全体删除
+    
     if len(prices) < 60:
-        print("  ⚠️  历史数据不足60天，使用 Fuzzy 仓位")
+        print(f"  ⚠️  历史数据不足60天（共 {len(prices_full)} 行）")
+        print("     可能原因1：某支股票最近上市（次新股）导致共同历史稀少")
+        print("     可能原因2：个别股票数据缺口")
+        print("  ⚠️  使用 Fuzzy 仓位")
         return pd.DataFrame()
 
     # ── 2. 协方差矩阵（Ledoit-Wolf 收缩，减少估计误差）─────────────
@@ -3451,13 +3472,16 @@ def black_litterman_weights(top: pd.DataFrame, daily_map: dict,
         ef = EfficientFrontier(bl_returns, S)
 
         # OPT C: Turnover-Aware 优化
+        # ✓ Bug fix: prev_weights 参数正确传入且有效使用（对齐上期权重，做换仓感知优化）
+        w_prev = None
         if prev_weights and cp is not None:
             # 对齐上期权重到当期股票池
-            w_prev = np.array([prev_weights.get(t, 0.0) for t in tickers])
-            total_prev = w_prev.sum()
+            w_prev_arr = np.array([prev_weights.get(t, 0.0) for t in tickers])
+            total_prev = w_prev_arr.sum()
             if total_prev > 1e-6:
-                w_prev = w_prev / total_prev
+                w_prev = w_prev_arr / total_prev
 
+        if w_prev is not None and cp is not None:
             # 换仓惩罚：双边手续费 0.4%（买入0.2% + 卖出0.2%）
             # 优化器会权衡：换仓收益 vs 0.4% * 换仓量
             try:
@@ -3475,7 +3499,7 @@ def black_litterman_weights(top: pd.DataFrame, daily_map: dict,
                 ef.max_sharpe(risk_free_rate=0.04/12)
                 weights = ef.clean_weights()
         else:
-            # 首次运行 / cvxpy 未装：标准 max_sharpe
+            # 首次运行 / cvxpy 未装 / 无上期权重：标准 max_sharpe
             ef.max_sharpe(risk_free_rate=0.04/12)
             weights = ef.clean_weights()
 
