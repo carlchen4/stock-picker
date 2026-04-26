@@ -57,6 +57,7 @@ except ImportError:
 # 本地运行时可改 source="xic" 自动从 BlackRock XIC ETF 更新
 
 TSX_UNIVERSE = [
+    "XIU.TO",  # 🎯 【新增】必须加入 TSX 60 ETF，否则基准收益永远是 0
     # 金融：六大银行 + 保险 + 资管
     "RY.TO","TD.TO","BNS.TO","BMO.TO","CM.TO","NA.TO",
     "MFC.TO","SLF.TO","GWO.TO","POW.TO","IFC.TO","FFH.TO",
@@ -482,9 +483,9 @@ CONSTRAINTS = {
     "vix_scale_threshold":25.0,   # VIX 高于此值时缩仓
     "vix_scale_factor":   0.70,   # VIX 高时仓位缩至 70%
     "min_listing_days":   252,
-    # 换仓缓冲带参数（Wealthsimple 免手续费版本 — 激进策略）
-    "rank_buffer":        15,     # 跌出前15名就果断卖掉（原25）
-    "score_tolerance":    0.01,   # 分数落后超过0.01就换（原0.02）
+    # 换仓缓冲带参数（Wealthsimple 免手续费版本 — 中度宽容）
+    "rank_buffer":        12,     # 🎯 容忍底线：跌出前18名（约前20%），动量衰竭则换股
+    "score_tolerance":    0.005,  # 🎯 噪音过滤：分数落后第10名超过0.015才执行换血
 }
 
 # 矿业子行业分类（OPT1 用）
@@ -497,7 +498,7 @@ FEATURE_COLS = [
     "mom_1m","mom_3m","mom_6m","mom_12m","mom_12_1",
     "vol_1m","vol_3m","vol_ratio",
     "rsi","bias_20","bias_60","vwap_bias","price_vs_52w_high",
-    "pe","pb","roe","eps_growth","fcf_yield",
+    "pe_rel_sector","pb","roe","eps_growth","fcf_yield",
     "oil_mom_3m","cadusd_mom_3m","bond_chg_3m","gold_mom_3m","vix_level",
     "sector_mom_rel",
     "month_sin","month_cos",
@@ -1203,6 +1204,7 @@ def build_panel(passed, daily_map, pit_map, macro_df):
             
             block = pd.concat([tech, macro_block, fund_block], axis=1)
             block["ticker"] = t
+            block["gics"]   = gics
             block.index.name = "date"
             # 财报日历特征（距下次/上次财报天数）
             earn_feats = compute_earnings_features(t, tech.index, earnings_cal)
@@ -1261,8 +1263,8 @@ def add_labels(panel):
             # 应急：直接用 0.05 的月度波动率（对应年化 ~17.3%）
             monthly_vol = pd.Series(0.05, index=common).clip(lower=0.01)
 
-        # 向量化计算风险调整后收益
-        ret = ret_resid / monthly_vol
+        # 向量化计算残差收益（取消波动率惩罚，释放高成长股的绝对收益空间！）
+        ret = ret_resid
 
         thr = ret.quantile(1-TOP_QUINTILE)
         for t in common:
@@ -1299,14 +1301,27 @@ def smart_impute(panel: pd.DataFrame, feature_cols: list) -> pd.DataFrame:
     智能特征插补：NaN → 行业截面中位数 → 全市场中位数。
 
     规则：
-      基本面（pe/pb/roe/eps_growth/fcf_yield）→ 同GICS行业、同月截面中位数
+      基本面（pe_rel_sector/pb/roe/eps_growth/fcf_yield）→ 同GICS行业、同月截面中位数
       技术/动量                               → 全市场截面中位数
       宏观                                    → 全局中位数（单一值）
       最终兜底                                → 0（极少数整列NaN情况）
 
     绝不盲目用 0：PE=0 会被模型误读为"估值极低的优质股"。
     """
-    FUNDAMENTAL_COLS = {"pe","pb","roe","eps_growth","fcf_yield","days_to_earnings","days_since_earnings"}
+    if "pe_rel_sector" not in panel.columns and "pe" in panel.columns:
+        out_for_pe = panel.copy()
+        if "gics" not in out_for_pe.columns:
+            tix = out_for_pe.index.get_level_values("ticker")
+            out_for_pe["gics"] = tix.map(lambda t: STOCK_PROFILE.get(t, {}).get("gics", "Unknown"))
+
+        sector_pe_median = out_for_pe.groupby(
+            [out_for_pe.index.get_level_values("date"), out_for_pe["gics"]]
+        )["pe"].transform("median")
+        out_for_pe["pe_rel_sector"] = out_for_pe["pe"] / sector_pe_median.replace(0, np.nan)
+        out_for_pe["pe_rel_sector"] = out_for_pe["pe_rel_sector"].replace([np.inf, -np.inf], np.nan)
+        panel = out_for_pe
+
+    FUNDAMENTAL_COLS = {"pe_rel_sector","pb","roe","eps_growth","fcf_yield","days_to_earnings","days_since_earnings"}
     MACRO_COLS       = {"oil_mom_3m","cadusd_mom_3m","bond_chg_3m",
                         "gold_mom_3m","vix_level"}
 
@@ -1747,6 +1762,9 @@ def walk_forward(panel, tx_cost=0.002):
             [dates[i]] * len(te),
             tix_wf
         ], names=["date", "ticker"]))
+
+        # 🚨【核心修复】：必须先按分数降序排序！否则排名和 cutoff_score 全是错的！
+        temp_df = temp_df.sort_values("ensemble_score", ascending=False)
         
         # 应用缓冲带
         prev_holdings_list = list(prev_h) if prev_h else []
@@ -1754,14 +1772,20 @@ def walk_forward(panel, tx_cost=0.002):
             current_ranked_df=temp_df,
             prev_holdings=prev_holdings_list,
             top_n=TOP_N,
-            rank_buffer=CONSTRAINTS.get("rank_buffer", 25),
-            score_tolerance=CONSTRAINTS.get("score_tolerance", 0.02)
+            rank_buffer=CONSTRAINTS.get("rank_buffer", 12),
+            score_tolerance=CONSTRAINTS.get("score_tolerance", 0.005)
         )
         
         # 从缓冲带结果提取最终的持仓索引
         selected_tickers = (temp_df_selected.index.get_level_values("ticker").tolist()
                            if isinstance(temp_df_selected.index, pd.MultiIndex)
                            else temp_df_selected.index.tolist())
+
+        # 🛡️【新增】ETF 扫单保护：如果选出的前 10 名连平均分都极低，说明全市场无 Alpha
+        if len(temp_df_selected) and temp_df_selected["ensemble_score"].mean() < 0.25:
+            print(f"  ⚠️  本月 Top 10 平均集成分数极低 ({temp_df_selected['ensemble_score'].mean():.3f})，触发 ETF 底线风控")
+            print("  🛡️ 建议清仓个股，全仓买入大盘指数 XIU.TO 或持币观望")
+            selected_tickers = []
         
         # 记录缓冲带保留情况（仅在首次或变化时打印）
         if i == MIN_TRAIN:
@@ -1811,9 +1835,14 @@ def walk_forward(panel, tx_cost=0.002):
             mktcap = float(meta_df.loc[t,"mktcap"]) if t in meta_df.index and "mktcap" in meta_df.columns else 5e9
             eff_tx = tx_cost*4 if mktcap<1e9 else (tx_cost*2 if mktcap<5e9 else tx_cost)
             ret_net = (ret_raw - eff_tx*2 if pd.notna(ret_raw) and is_new else ret_raw)
+            
+            # 🎯 【核心新增】：让回测报告完美继承缓冲带的选择：给选中的股票强行加 10 分！
+            ens_to_save = ens[j] + 10.0 if j in top_idx else ens[j]
+            
             if j in top_idx:
                 curr_h.add(t)
-            recs.append({"date":dates[i],"ticker":t,"ens":ens[j],
+            # 🎯 【修改】：保存 ens_to_save 而不是 ens[j]
+            recs.append({"date":dates[i],"ticker":t,"ens":ens_to_save,
                          "actual_ret":row.get("next_ret_abs", ret_raw),"actual_ret_net":ret_net,
                          "actual_cls":row.get("label",np.nan)})
 
@@ -2201,20 +2230,20 @@ def get_defensive_replacements(panel, current_pick_tickers, count=3):
     
     return []
 
-def apply_rebalancing_band(current_ranked_df, prev_holdings, top_n=10, rank_buffer=25, score_tolerance=0.02):
+def apply_rebalancing_band(current_ranked_df, prev_holdings, top_n=10, rank_buffer=12, score_tolerance=0.005):
     """
     换仓缓冲带：降低换手率，保护 Alpha 不被手续费反噬。
     
     双重缓冲逻辑：
-      1. 排名缓冲（Rank Buffer）：如果老持仓掉出前10名，但仍在前25名以内，不踢出去
-      2. 分数缓冲（Score Tolerance）：如果老持仓与第10名的分数差额小于0.02，说明潜力相近，保留
+    1. 排名缓冲（Rank Buffer）：如果老持仓掉出前10名，但仍在前12名以内，不踢出去
+    2. 分数缓冲（Score Tolerance）：如果老持仓与第10名的分数差额小于0.005，说明潜力相近，保留
     
     参数：
       current_ranked_df   → 当月排序好的预测结果 (按 ensemble_score 降序)
       prev_holdings       → 上个月的持仓股票列表 (Ticker 列表)
       top_n              → 目标持仓数 (默认10)
-      rank_buffer         → 排名容忍范围 (默认25)
-      score_tolerance     → 分数容忍差值 (默认0.02)
+    rank_buffer         → 排名容忍范围 (默认12)
+    score_tolerance     → 分数容忍差值 (默认0.005)
     
     返回：保留或新增的股票 DataFrame，仍按 ensemble_score 降序排列
     """
@@ -2268,7 +2297,8 @@ def apply_rebalancing_band(current_ranked_df, prev_holdings, top_n=10, rank_buff
     final_df = current_ranked_df[mask].sort_values("ensemble_score", ascending=False)
     return final_df
 
-def predict_now(panel, daily_map, meta_df, wf=None, macro_df=None, current_holdings=None):
+def predict_now(panel, daily_map, meta_df, wf=None, macro_df=None,
+                current_holdings=None, prev_weights_dict=None):
     dates = sorted(panel.index.get_level_values("date").unique())
     sc    = StandardScaler()
 
@@ -2323,6 +2353,34 @@ def predict_now(panel, daily_map, meta_df, wf=None, macro_df=None, current_holdi
     out["name"]   = tix.map(meta_df["name"].to_dict())
     out["sector"] = tix.map(meta_df["sector"].to_dict())
     out = out.sort_values("ensemble_score", ascending=False)
+    
+    # 🎯 【新增核心逻辑】：在应用缓冲带前，从至少前60名提取DML样本池（因果推断需要充分样本）
+    print("\\n  [DML因果推断] 从全排名中提取前60支股票...")  
+    top60_candidates = out.head(60) if len(out) >= 60 else out
+    top60_tickers = (top60_candidates.index.get_level_values("ticker").tolist()
+                     if isinstance(top60_candidates.index, pd.MultiIndex)
+                     else top60_candidates.index.tolist())
+    print(f"    ℹ️  DML 样本池：{len(top60_tickers)} 支（足以进行因果推断）")
+    
+    # 提取盈利惊喜信号
+    surprise_df = pd.DataFrame()
+    try:
+        surprise_df = fetch_earnings_surprise(top60_tickers)
+        
+        # 运行 DML 双重机器学习（估计事件信号的纯因果效应）
+        if not surprise_df.empty:
+            print("    [DML] 用双重机器学习替代固定乘数，动态调整预测分数...")
+            try:
+                # 应用 DML 调整到整个 out（用因果效应替代固定权重）
+                out = apply_dml_signal(out, panel, pd.DataFrame(), surprise_df)
+                out = out.sort_values("ensemble_score", ascending=False)
+                print("    ✅ DML 因果调整完毕（已融入排名）")
+            except Exception as e_dml:
+                print(f"    ⚠️  DML 失败（{str(e_dml)[:50]}），保留原分数")
+        else:
+            print("    ⚠️  未能获取财报数据，跳过DML")
+    except Exception as e:
+        print(f"    ⚠️  盈利惊喜提取失败（{str(e)[:50]}）")
     
     # ★ Plan 2: 从 MLP 模型提取 MC Dropout 不确定性
     mc_dropout_variance = {}
@@ -2474,8 +2532,8 @@ def predict_now(panel, daily_map, meta_df, wf=None, macro_df=None, current_holdi
             current_ranked_df=out,
             prev_holdings=current_holdings,
             top_n=TOP_N,
-            rank_buffer=CONSTRAINTS.get("rank_buffer", 25),
-            score_tolerance=CONSTRAINTS.get("score_tolerance", 0.02)
+            rank_buffer=CONSTRAINTS.get("rank_buffer", 12),
+            score_tolerance=CONSTRAINTS.get("score_tolerance", 0.005)
         )
         
         # 统计保留了多少老持仓
@@ -2528,18 +2586,76 @@ def predict_now(panel, daily_map, meta_df, wf=None, macro_df=None, current_holdi
                 
                 # 添加替补（赋予当前平均分数，确保排序合理）
                 avg_score = out["ensemble_score"].mean()
+                avg_ret   = out["pred_return"].mean() if "pred_return" in out.columns else 0.0
+                avg_prob  = out["pred_top20pct"].mean() if "pred_top20pct" in out.columns else 0.5
                 for rep_idx in replacements:
                     if rep_idx not in out.index and rep_idx in panel.index:
                         try:
                             out = pd.concat([out, panel.loc[[rep_idx]]])
-                            # 更新替补的 ensemble_score 为平均值，保持排序合理
+                            # 🎯 【修改】：把所有 NaN 空洞填上平均值
                             out.loc[rep_idx, "ensemble_score"] = avg_score
+                            out.loc[rep_idx, "pred_return"]    = avg_ret
+                            out.loc[rep_idx, "pred_top20pct"]  = avg_prob
                         except Exception as e:
                             print(f"    ⚠️  添加替补 {rep_idx} 失败：{e}")
                 
                 # 重新排序
                 out = out.sort_values("ensemble_score", ascending=False)
                 print(f"  ✓ 中性化后：{len(out)} 支 (Energy/HighVol 占比：{len(concentrated_group)/len(out)*100:.0f}%)")
+
+    # ─── 【终极保险】Cash / ETF Sweep ───────────────────────────
+    # 如果头部信号整体太弱，强行买入个股只是在追逐噪音
+    if not out.empty:
+        top_10_mean_score = out["ensemble_score"].head(TOP_N).mean()
+        if pd.notna(top_10_mean_score) and top_10_mean_score < 0.25:
+            print(f"\n  ⚠️  警告：本月 Top 10 平均集成分数极低 ({top_10_mean_score:.3f})，全市场缺乏强 Alpha 信号！")
+            print("  🛡️ 触发 ETF 底线风控：建议清仓个股，全仓买入大盘指数 XIU.TO 或持币观望。")
+
+            etf_ticker = "XIU.TO"
+            etf_date = dates[-1] if len(dates) else pd.Timestamp.today().normalize()
+            etf_name = "iShares S&P/TSX 60 Index ETF"
+
+            # 补一份可供后续打印/仓位模块使用的日线数据
+            if etf_ticker not in daily_map or daily_map[etf_ticker].empty:
+                etf_daily = None
+                try:
+                    etf_hist = yf.download(etf_ticker, period="10d", auto_adjust=True, progress=False)
+                    if not etf_hist.empty:
+                        latest = etf_hist.iloc[-1]
+                        etf_daily = pd.DataFrame({
+                            "open":   [float(latest.get("Open", latest.get("Close", 1.0)))],
+                            "high":   [float(latest.get("High", latest.get("Close", 1.0)))],
+                            "low":    [float(latest.get("Low", latest.get("Close", 1.0)))],
+                            "close":  [float(latest.get("Close", 1.0))],
+                            "volume": [float(latest.get("Volume", 1.0))],
+                        }, index=[etf_date])
+                except Exception:
+                    etf_daily = None
+
+                if etf_daily is None:
+                    etf_daily = pd.DataFrame({
+                        "open":   [1.0],
+                        "high":   [1.0],
+                        "low":    [1.0],
+                        "close":  [1.0],
+                        "volume": [1.0],
+                    }, index=[etf_date])
+
+                daily_map[etf_ticker] = etf_daily
+
+            etf_row = {col: np.nan for col in out.columns}
+            etf_row.update({
+                "pred_return": 0.0,
+                "pred_top20pct": 0.0,
+                "ensemble_score": float(top_10_mean_score),
+                "name": etf_name,
+                "sector": "ETF",
+            })
+            out = pd.DataFrame(
+                [etf_row],
+                index=pd.MultiIndex.from_tuples([(etf_date, etf_ticker)], names=["date", "ticker"])
+            )
+            print(f"  ✅ 已切换到 ETF 兜底标的：{etf_ticker}")
 
     imp = pd.Series(xgb_r.feature_importances_,
                     index=FEATURE_COLS).sort_values(ascending=False)
@@ -3299,19 +3415,22 @@ class RealisticBacktest:
                 self.nav_history.append({"date":date,"nav":self._current_nav(curr_prices)})
                 continue
 
-            top_scores = month_scores.nlargest(TOP_N, "ens")
-            target_tickers = set(top_scores["ticker"].tolist())
+            ranked_df = (month_scores.sort_values("ens", ascending=False)
+                         .rename(columns={"ens": "ensemble_score"})
+                         .set_index("ticker"))
+            selected_df = apply_rebalancing_band(
+                current_ranked_df=ranked_df,
+                prev_holdings=list(self.positions.keys()),
+                top_n=TOP_N,
+                rank_buffer=CONSTRAINTS.get("rank_buffer", 12),
+                score_tolerance=CONSTRAINTS.get("score_tolerance", 0.005),
+            )
+            target_tickers = set(
+                selected_df.index.get_level_values("ticker").tolist()
+                if isinstance(selected_df.index, pd.MultiIndex)
+                else selected_df.index.tolist()
+            )
             current_tickers = set(self.positions.keys())
-
-            # ── 持仓惯性：评分差异小于阈值的保持持仓 ─────────────
-            score_dict = dict(zip(top_scores["ticker"], top_scores["ens"]))
-            keep = set()
-            for t in current_tickers:
-                if t in score_dict:
-                    old_rank = list(top_scores["ticker"]).index(t) if t in list(top_scores["ticker"]) else TOP_N
-                    if old_rank < TOP_N and score_dict[t] > top_scores["ens"].quantile(0.3):
-                        keep.add(t)
-            target_tickers = target_tickers | (current_tickers & keep)
 
             # ── 卖出不在目标中的持仓 ──────────────────────────────
             to_sell = current_tickers - target_tickers
@@ -3492,7 +3611,7 @@ def run_advanced_analysis(panel, daily_map, pit_map, meta_df, macro_df, wf,
         print("\n【D】真实回测框架")
         bt = RealisticBacktest(
             capital       = 100_000,
-            tx_cost       = 0.002,
+            tx_cost       = BT_TX_COST,
             bid_ask       = 0.001,
             market_impact = 0.002,
             stop_loss     = STOP_LOSS_PCT,
@@ -3760,6 +3879,7 @@ def black_litterman_weights(top: pd.DataFrame, daily_map: dict,
                              meta_df: pd.DataFrame,
                              risk_aversion: float = 2.5,
                              prev_weights: dict = None,
+                             prev_weights_dict: dict = None,
                              pred_variance: dict = None) -> pd.DataFrame:
     """
     用 Black-Litterman 模型替换 Fuzzy 仓位分配。
@@ -3772,7 +3892,8 @@ def black_litterman_weights(top: pd.DataFrame, daily_map: dict,
 
     参数：
       risk_aversion: 风险厌恶系数（越高越保守，一般2-4）
-      prev_weights:  上期持仓权重，用于换仓感知优化
+            prev_weights:  上期持仓权重，用于换仓感知优化（兼容旧调用）
+            prev_weights_dict:  上期真实持仓权重字典，用于换仓感知优化
       pred_variance: MC Dropout 预测不确定性（方差），用于动态调整观点置信度
 
     输出：每支股票的最优仓位比例（合计100%）
@@ -3883,6 +4004,8 @@ def black_litterman_weights(top: pd.DataFrame, daily_map: dict,
         
         confidences[t] = float(np.clip(confidence, 0.3, 0.9))
 
+    effective_prev_weights = prev_weights_dict if prev_weights_dict is not None else prev_weights
+
     # ── 6. Black-Litterman 模型 ───────────────────────────────────
     try:
         bl = BlackLittermanModel(
@@ -3913,9 +4036,9 @@ def black_litterman_weights(top: pd.DataFrame, daily_map: dict,
         # 3. 交易成本惩罚（如果有上期权重）
         # ✓ Bug fix: prev_weights 参数正确传入且有效使用（对齐上期权重，做换仓感知优化）
         w_prev = None
-        if prev_weights and cp is not None:
-            # 对齐上期权重到当期股票池
-            w_prev_arr = np.array([prev_weights.get(t, 0.0) for t in tickers])
+        if effective_prev_weights and cp is not None:
+            # 对齐真实上期权重到当期股票池
+            w_prev_arr = np.array([effective_prev_weights.get(t, 0.0) for t in bl_returns.index])
             total_prev = w_prev_arr.sum()
             if total_prev > 1e-6:
                 w_prev = w_prev_arr / total_prev
@@ -3926,16 +4049,23 @@ def black_litterman_weights(top: pd.DataFrame, daily_map: dict,
             try:
                 ef.add_objective(
                     objective_functions.transaction_cost,
-                    w_prev=w_prev, k=0.002
+                    w_prev=w_prev, k=0.0015
                 )
                 ef.max_sharpe(risk_free_rate=0.04/12)
                 weights = ef.clean_weights()
-                turnover = float(np.abs(
-                    np.array(list(weights.values())) - w_prev).sum())
+                all_tickers = set(weights.keys()).union(set(effective_prev_weights.keys()) if effective_prev_weights else set())
+                turnover = sum(abs(weights.get(t, 0.0) - (effective_prev_weights.get(t, 0.0) if effective_prev_weights else 0.0)) for t in all_tickers)
                 print(f"  BL 最优仓位：边界约束[2%-15%] + L2 正则化 + 换仓成本")
-                print(f"  换仓量 {turnover*100:.1f}%（含成本惩罚）")
+                print(f"  真实换手率 {turnover*100:.1f}%（基于当前 Wealthsimple 持仓）")
             except Exception as e_opt:
                 print(f"  ⚠️  交易成本优化失败（{e_opt}），使用标准最优解")
+                # 🎯 【核心修改】：一旦前面的 ef 失败，必须重新实例化一个新的 ef，否则会报错
+                ef = EfficientFrontier(bl_returns, S, weight_bounds=(0.02, 0.15))
+                try:
+                    from pypfopt import objective_functions
+                    ef.add_objective(objective_functions.L2_reg, gamma=0.1)
+                except:
+                    pass
                 ef.max_sharpe(risk_free_rate=0.04/12)
                 weights = ef.clean_weights()
         else:
@@ -4437,6 +4567,7 @@ def apply_dml_signal(result: pd.DataFrame, panel: pd.DataFrame,
 
 def run_new_modules(panel, daily_map, meta_df, macro_df, wf,
                     result, imp, dd_signal,
+                    prev_weights_dict: dict = None,
                     # 邮件配置（填写后自动发送）
                     email_to:       str = "your@email.com",
                     email_from:     str = "your@gmail.com",
@@ -4463,42 +4594,24 @@ def run_new_modules(panel, daily_map, meta_df, macro_df, wf,
     print(f"  约束调整：{regime_constraints}")
 
     # ── F. Earnings Surprise ──────────────────────────────────────
-    print("\n【F】Earnings Surprise（盈利惊喜）& DML 因果调整")
+    print("\n【F】Earnings Surprise（盈利惊喜）报告")
     
-    # ★ 修复：提前提取信号，避免样本不足
-    # 1. 先从所有候选中取前 60 支作为宽泛候选池（DML 需要足够样本）
-    broad_pool_size = max(60, TOP_N * 6)  # 至少是 TOP_N 的 6 倍
-    broad_candidates = result.nlargest(broad_pool_size, "ensemble_score") if hasattr(result, 'nlargest') else result.head(broad_pool_size)
-    broad_tickers = (broad_candidates.index.get_level_values("ticker").tolist()
-                     if isinstance(broad_candidates.index, pd.MultiIndex)
-                     else broad_candidates.index.tolist())
-    
-    print(f"  [前置] 从 {len(result)} 支所有候选中取前 {len(broad_tickers)} 支作为 DML 样本池")
-    
-    # 2. 获取财报惊喜
-    surprise_df = pd.DataFrame()
-    try:
-        surprise_df = fetch_earnings_surprise(broad_tickers)
-        
-        # 3. 运行 DML 因果调整（现在有足够样本了）
-        if not surprise_df.empty:
-            print("  [DML] 用双重机器学习估计事件信号的纯因果效应...")
-            try:
-                # DML 调整整个 result（不限制到 TOP_N）
-                result = apply_dml_signal(result, panel, insider_df, surprise_df)
-                print("  ✅ DML 动态调整已融入排名（替代固定乘数）")
-            except Exception as e_dml:
-                print(f"  ⚠️  DML 失败（{e_dml}），fallback 到固定乘数")
-                result = apply_earnings_signal(result, surprise_df, weight=0.12)
-        else:
-            print("  ⚠️  未获取到财报数据，跳过 DML")
-            
-    except Exception as e:
-        print(f"  ⚠️  Earnings Surprise 获取失败：{e}")
-    
-    # 4. DML 调整完成后，重新排序 result（分数已被 DML 调整）
-    if result is not None:
-        result = result.sort_values("ensemble_score", ascending=False)
+    # 🎯 DML 已在 predict_now 中提前执行！这里只打印报表，不重复计算
+    # DML 导致 result 已经被因果调整过，所以这里只需要提取 surprise_df 用于报告
+    if result is not None and not result.empty:
+        # 从 result 前60中再次提取 surprise_df 用于报告生成（不影响分数）
+        try:
+            top60_for_report = result.head(60)
+            top60_tickers_report = (top60_for_report.index.get_level_values("ticker").tolist()
+                                   if isinstance(top60_for_report.index, pd.MultiIndex)
+                                   else top60_for_report.index.tolist())
+            surprise_df = fetch_earnings_surprise(top60_tickers_report)
+            print(f"  ℹ️  {len(surprise_df)} 支股票有财报数据（仅供报告参考，分数已在predict_now调整）")
+        except Exception as e:
+            print(f"  ⚠️  财报获取失败：{str(e)[:50]}")
+            surprise_df = pd.DataFrame()
+    else:
+        surprise_df = pd.DataFrame()
 
     # ── G. Black-Litterman ────────────────────────────────────────
     print("\n【G】Black-Litterman 最优仓位")
@@ -4507,9 +4620,9 @@ def run_new_modules(panel, daily_map, meta_df, macro_df, wf,
     if result is not None:
         try:
             top = result.head(TOP_N)
-            # OPT C: 传入上期持仓权重实现换仓感知优化
-            prev_bl_weights = {}
-            if not wf.empty and "ens" in wf.columns:
+            # 优先使用 Wealthsimple 真实持仓权重；没有时再回退到 WF 上月等权持仓
+            prev_bl_weights = prev_weights_dict or {}
+            if not prev_bl_weights and not wf.empty and "ens" in wf.columns:
                 last_date  = wf["date"].max()
                 last_picks = wf[wf["date"] == last_date].nlargest(TOP_N, "ens")
                 n_picks    = len(last_picks)
@@ -4520,7 +4633,7 @@ def run_new_modules(panel, daily_map, meta_df, macro_df, wf,
                     }
             bl_df = black_litterman_weights(top, daily_map, meta_df,
                                              risk_aversion=2.5,
-                                             prev_weights=prev_bl_weights,
+                                             prev_weights_dict=prev_bl_weights,
                                              pred_variance=mc_dropout_variance)
             if not bl_df.empty:
                 print_bl_weights(bl_df, regime.regime)
@@ -4655,16 +4768,15 @@ def backtest_from_wf(wf, daily_map, meta_df, top_n=10):
         hdf      = pd.DataFrame(holdings)
         port_ret = hdf["contrib"].sum()
 
-        # 基准日期匹配：找最接近的月末日期（±5天容忍）
+        # 基准日期匹配：放宽一点条件
         ts_date = pd.Timestamp(date)
         bench_ret = 0.0
+        # 🎯 【修改匹配逻辑】：把原本匹配日期的逻辑，改成只匹配"年月"即可
+        date_ym = ts_date.strftime("%Y-%m")
         for bk, bv in bench_rets.items():
-            try:
-                if abs((pd.Timestamp(bk) - ts_date).days) <= 5:
-                    bench_ret = float(bv) * 100
-                    break
-            except Exception:
-                pass
+            if str(bk).startswith(date_ym):  # 只要年月对得上就取
+                bench_ret = float(bv) * 100
+                break
 
         nav_before = nav
         nav        = nav * (1 + port_ret / 100)
@@ -4854,29 +4966,39 @@ if __name__ == "__main__":
         panel = smart_impute(panel, FEATURE_COLS)
         panel = cross_z(panel)
 
-        wf = walk_forward(panel, tx_cost=0.002)
+        wf = walk_forward(panel, tx_cost=BT_TX_COST)
         evaluate(wf)
 
         # 完整模型逐月 P&L 报告（用Walk-Forward的真实预测结果）
         backtest_report(wf, panel, daily_map, meta_df,
                         initial_capital = INITIAL_CAPITAL,
-                        tx_cost         = 0.002,
+                        tx_cost         = BT_TX_COST,
                         stop_loss       = STOP_LOSS_PCT,
                         benchmark       = "XIU.TO")
 
-        # 🎯 【新增】：激活实盘换仓缓冲带
-        # 👇 在这里填入你目前券商账户里"真实持有"的股票代码
-        # 每月运行代码前，根据你账户的实际情况更新这个列表
-        # 示例（替换为你的真实持仓）：
-        MY_CURRENT_HOLDINGS = [
-            "BMO.TO", "MFC.TO", "NTR.TO", "EMA.TO", "LUN.TO", 
-            "DIR-UN.TO", "ENGH.TO", "ARX.TO", "CNQ.TO", "FTT.TO"
-        ]
+        # 🎯 【新增】：把 Wealthsimple 里的真实仓位比例写成字典
+        # 每月运行前按账户实际持仓更新；权重总和尽量接近 1.0
+        MY_CURRENT_PORTFOLIO = {
+            "BMO.TO": 0.152,
+            "MFC.TO": 0.148,
+            "NTR.TO": 0.105,
+            "EMA.TO": 0.120,
+            "HBM.TO": 0.145,
+            "DIR-UN.TO": 0.070,
+            "ENGH.TO": 0.020,
+            "CNQ.TO": 0.150,
+            "ARX.TO": 0.020,
+            "CAE.TO": 0.020,
+        }
 
-        # 🎯 【修改】：把真实持仓传给 predict_now，激活实盘换仓缓冲带
+        # 提取名字列表给“换仓缓冲带”用
+        current_tickers_only = list(MY_CURRENT_PORTFOLIO.keys())
+
+        # 🎯 【修改】：把真实持仓和真实权重都传给 predict_now
         result, imp, dd_signal = predict_now(
             panel, daily_map, meta_df, wf, macro_df=macro_df,
-            current_holdings=MY_CURRENT_HOLDINGS  # 👈 关键参数：启用缓冲带
+            current_holdings=current_tickers_only,
+            prev_weights_dict=MY_CURRENT_PORTFOLIO,
         )
 
         # 高级模块（共线性 / SEDI / 参数敏感性 / 真实回测框架）
@@ -4905,6 +5027,7 @@ if __name__ == "__main__":
         result, bl_df, surprise_df, regime = run_new_modules(
             panel, daily_map, meta_df, macro_df, wf,
             result, imp, dd_signal,
+            prev_weights_dict=MY_CURRENT_PORTFOLIO,
             email_to       = EMAIL_CONFIG["to"],
             email_from     = EMAIL_CONFIG["from"],
             email_password = EMAIL_CONFIG["password"],
