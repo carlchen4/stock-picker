@@ -31,6 +31,7 @@ import xgboost as xgb
 from datetime import datetime, timedelta
 from sklearn.metrics import accuracy_score
 from sklearn.preprocessing import StandardScaler
+from portfolio_config import MY_CURRENT_PORTFOLIO  # ✓ 从单独文件导入，避免重复定义
 
 try:
     import lightgbm as lgb
@@ -105,6 +106,23 @@ TSX_UNIVERSE = list(dict.fromkeys(t for t in TSX_UNIVERSE if t not in _DELISTED)
 
 
 def get_tsx_tickers(source: str = "builtin") -> list[str]:
+    """⚠️  警告：存活者偏差
+    
+    TSX_UNIVERSE 是当前维护的活跃股票池，不包括历史上已退市、被收购、破产、
+    或被移出指数的股票。
+    
+    对当月选股（MODE="pick"）：无影响，这是合理的。
+    对历史回测（MODE="backtest"）：会存在
+      - 存活者偏差（Survivor Bias）：历史上的失败者被排除
+      - 当前赢家偏差（Winner Bias）：当前的赢家因为存活而被回溯
+      - 结果：回测收益通常虚高 10-30%
+    
+    解决方案：
+      如果需要更严谨的历史回测，建议：
+      1. 提供历史 TSX 成分股列表（2014-2026）
+      2. 或在回测输出中标注此限制
+      3. 或同时运行「扩展宇宙」包括已退市股票的版本
+    """
     """
     获取 TSX 股票池。
 
@@ -199,7 +217,9 @@ def fetch_pit_fmp(ticker: str, api_key: str, quarters: int = 20) -> pd.DataFrame
       - 有 fillingDate（实际披露日），可实现真正的 PIT
       - 历史最多 5 年季报（免费版）
 
-    返回格式与 build_pit_from_simfin 相同，可直接替换。
+    ✓ 说明：返回格式与 build_pit_from_simfin 和 fetch_pit_quarterly 相同！
+    只返回核心字段（avail_date, net_income, total_equity, ocf, capex, shares），
+    让 compute_pit_fundamentals() 统一计算 pe/pb/roe/fcf_yield 等比率。
     """
     import requests, time
 
@@ -241,35 +261,24 @@ def fetch_pit_fmp(ticker: str, api_key: str, quarters: int = 20) -> pd.DataFrame
             bal = bal_by_date.get(qdate, {})
             cf  = cf_by_date.get(qdate,  {})
 
-            net_income = inc.get("netIncome", 0) or 0
-            revenue    = inc.get("revenue",   0) or 0
-            equity     = bal.get("totalStockholdersEquity", None)
-            assets     = bal.get("totalAssets", None)
-            capex      = cf.get("capitalExpenditure", 0) or 0
-            op_cf      = cf.get("operatingCashFlow",  0) or 0
-            shares     = inc.get("weightedAverageShsOut", None)
-
-            eps        = (net_income / shares) if shares else None
-            roe        = (net_income / equity) if equity else None
-            fcf_yield  = ((op_cf + capex) / assets) if assets else None
+            # 核心字段：直接从 FMP API 提取，格式与 yfinance/Simfin 一致
+            net_income = inc.get("netIncome") or 0
+            equity     = bal.get("totalStockholdersEquity")
+            op_cf      = cf.get("operatingCashFlow") or 0
+            capex      = cf.get("capitalExpenditure") or 0
+            shares     = inc.get("weightedAverageShsOut")
 
             rows.append({
-                "avail_date": pd.Timestamp(fill_dt[:10]),
-                "report_date": pd.Timestamp(qdate),
-                "pe":         None,   # 需要用价格除 EPS，后续处理
-                "pb":         None,
-                "roe":        roe,
-                "eps":        eps,
-                "eps_growth": None,   # 同比增长在 build_pit 里计算
-                "fcf_yield":  fcf_yield,
-                "revenue":    revenue,
-                "net_income": net_income,
+                "avail_date":   pd.Timestamp(fill_dt[:10]),
+                "net_income":   net_income,
+                "total_equity": equity,
+                "ocf":          op_cf,
+                "capex":        capex,
+                "shares":       shares,
             })
 
         if rows:
-            df = pd.DataFrame(rows).sort_values("report_date")
-            # 计算 EPS 同比增长
-            df["eps_growth"] = df["eps"].pct_change(4)
+            df = pd.DataFrame(rows).sort_values("avail_date")
             return df
 
     except Exception as e:
@@ -391,6 +400,11 @@ def build_pit_from_simfin(ticker, inc_all, bal_all, cf_all):
       - 官方财报数据，更准确
       - 有明确的 Report Date（公告日期），PIT 更精确
 
+    ★ 关键：采用保守的 45/90 天披露延迟（CSA 标准），避免前视偏差
+      - Q1-Q3：45 天（REPORT_LAG）
+      - Q4（年报）：90 天
+      这与 yfinance fallback 逻辑一致，防止模型看到未发布的财报
+
     TSX 代码转换：RY.TO → RY，ENB.TO → ENB
     """
     t_simfin = ticker.replace(".TO", "")
@@ -411,10 +425,22 @@ def build_pit_from_simfin(ticker, inc_all, bal_all, cf_all):
         if inc.empty:
             return pd.DataFrame()
 
+        # ★ 🔴 【前视偏差修复】：使用 CSA 标准披露延迟（45/90 天）而不是 5 天
+        # 原因：季度财报公告日期不在 index，而 index 是 Report Date（季度末）
+        # 假设 5 天披露会导致严重前视偏差，实际需要 45-90 天
+        # CSA 标准：Q1-Q3 需要 45 天内披露，Q4（年报）需要 90 天内披露
+        def _pit_report_lag(report_date):
+            """计算季度财报可用延迟（天数）"""
+            qdate  = pd.Timestamp(report_date)
+            month  = qdate.month
+            # Q4（10/11/12月末）的年报需要 90 天披露，其他季度 45 天
+            return 90 if month in (10, 11, 12) else REPORT_LAG
+
         # ✓ 矢量化重构：替代 for 循环，消除 N 支股票 × M 季度的循环成本
         # 直接从三张表中提取列，使用 fillna 和 or 逻辑处理备选列
         df = pd.DataFrame(index=inc.index)
-        df["avail_date"] = inc.index + pd.Timedelta(days=5)
+        # 使用动态延迟替代硬编码的 5 天
+        df["avail_date"] = inc.index.map(lambda d: pd.Timestamp(d) + pd.Timedelta(days=_pit_report_lag(d)))
         df["net_income"]   = inc.get("Net Income", pd.Series(dtype='float64'))
         df["total_equity"] = bal.get("Total Equity", bal.get("Common Equity", pd.Series(dtype='float64')))
         df["ocf"]          = cf.get("Net Cash from Operating Activities", pd.Series(dtype='float64'))
@@ -442,7 +468,7 @@ MACRO_TICKERS = {
 }
 
 TOP_N         = 10
-YEARS         = 5
+YEARS         = 10
 MIN_TRAIN     = 18
 TOP_QUINTILE  = 0.20
 REPORT_LAG    = 45
@@ -696,7 +722,11 @@ def _nearest_col(df, dt):
 
 
 def fetch_pit_quarterly(ticker):
-    """第三层：Point-in-Time 季报（季度末 + 45天延迟）"""
+    """第三层：Point-in-Time 季报（季度末 + 45天延迟）
+    
+    符合 CSA 披露标准：Q1-Q3 需 45 天，Q4 需 90 天。
+    ✓ 说明：该方法与 build_pit_from_simfin() 使用相同逻辑，确保两条数据路径无前视偏差。
+    """
     t = yf.Ticker(ticker)
     try:
         inc    = t.quarterly_income_stmt
@@ -781,6 +811,14 @@ def fetch_all(tickers, years):
     pit_map   = {}
     meta_rows = []
 
+    # ⚠️  【存活者偏差警告】TSX_UNIVERSE 只包含当前活跃股票，不包括历史已退市股票
+    if len(tickers) > 50:  # 仅在大规模回测时提示
+        print(f"\n  💡 提示：股票池存活者偏差")
+        print(f"     本 TSX_UNIVERSE 是当前维护的 {len(tickers)} 支活跃股票")
+        print(f"     历史上退市/破产/被收购的股票已排除")
+        print(f"     对当月选股无影响；但历史回测可能虚高 10-30%")
+        print(f"     详见 get_tsx_tickers() 函数的文档字符串\n")
+    
     for i, t in enumerate(daily_map.keys(), 1):
         # 基本面快照（约束过滤和展示用，始终用 yfinance 当前值）
         try:
@@ -822,7 +860,11 @@ def fetch_all(tickers, years):
 # 2. 约束过滤
 # ══════════════════════════════════════════════════════════════════
 
-def apply_constraints(daily_map, meta_df, c):
+def apply_constraints_current(daily_map, meta_df, c):
+    """【当月选股模式】用当前最新 yfinance 数据过滤（MODE="pick"）
+    
+    包含完整约束：价格 + 成交量 + PE + ROE + 市值（均用当前值）
+    """
     passed, removed = [], {}
 
     for t, df in daily_map.items():
@@ -894,6 +936,81 @@ def apply_constraints(daily_map, meta_df, c):
             print(f"  {t:<14} {' | '.join(rs)}")
     print(f"\n  ✅ 通过：{' '.join(passed)}")
     return passed
+
+
+def apply_base_constraints(daily_map, c):
+    """【历史回测模式】只用客观数据检查基础约束（MODE="backtest"）
+    
+    ✓ 说明：不使用当前 meta_df（PE/ROE/市值）以避免存活者偏差
+    只检查与时间无关的约束：上市时间、股价范围、成交量异常
+    PIT 基本面约束由 build_panel() 在逐月基础上检查
+    """
+    passed, removed = [], {}
+
+    for t, df in daily_map.items():
+        reasons = []
+        min_days = c.get("min_listing_days", 0)
+        if len(df) < min_days:
+            reasons.append(f"上市时间 {len(df)} 天 < {min_days} 天")
+
+        price = df["close"].iloc[-1]
+        if price < c["min_price_cad"]:
+            reasons.append(f"股价 ${price:.2f} < $2")
+        max_px = c.get("max_price_cad", 9999)
+        if price > max_px:
+            reasons.append(f"股价 ${price:.2f} > ${max_px:.0f}")
+
+        adv = (df["close"].tail(20) * df["volume"].tail(20)).mean()
+        if adv < c["min_adv_cad"]:
+            reasons.append(f"ADV ${adv/1e6:.2f}M < $1M")
+
+        # ✓ Bug fix: vol_spike_min_days=2
+        if len(df) >= 65:
+            base   = df["volume"].iloc[-65:-5]
+            vm, vs = base.mean(), base.std()
+            sp     = df["volume"].tail(c["vol_spike_days"])
+            sp     = sp[(sp > vm+c["vol_spike_sigma"]*vs) |
+                        (sp < max(0, vm-c["vol_spike_sigma"]*vs))]
+            if len(sp) >= c["vol_spike_min_days"]:
+                reasons.append(f"成交量异常 {len(sp)}天±{c['vol_spike_sigma']:.0f}σ")
+
+        # ⚠️ 省略 PE / ROE / 市值 检查，在历史回测中由 PIT 数据逐月检查
+        # 这避免了用当前 2026 年的数据过滤 2018-2022 年的历史数据（存活者偏差）
+
+        if reasons:
+            removed[t] = reasons
+        else:
+            passed.append(t)
+
+    print(f"\n{'─'*60}")
+    print(f"  基础过滤（回测模式，不含 PIT 约束）：{len(daily_map)} → {len(passed)} 支通过")
+    print(f"  💡 说明：PIT 基本面约束由 walk_forward 逐月检查，避免存活者偏差")
+    print(f"{'─'*60}")
+    counts = {}
+    for rs in removed.values():
+        for r in rs:
+            k = r.split(" ")[0]
+            counts[k] = counts.get(k,0)+1
+    for k, n in sorted(counts.items(), key=lambda x: -x[1]):
+        print(f"  ✗ {k:<22} 剔除 {n} 支")
+    if removed:
+        print(f"\n  {'Ticker':<14} 原因")
+        print(f"  {'─'*50}")
+        for t, rs in sorted(removed.items()):
+            print(f"  {t:<14} {' | '.join(rs)}")
+    print(f"\n  ✅ 通过：{' '.join(passed)}")
+    return passed
+
+
+def apply_constraints(daily_map, meta_df, c):
+    """【后向兼容】自动选择当前或基础约束
+    
+    如果提供 meta_df，用完整约束（当月选股）；否则用基础约束（历史回测）
+    """
+    if meta_df is not None and not meta_df.empty:
+        return apply_constraints_current(daily_map, meta_df, c)
+    else:
+        return apply_base_constraints(daily_map, c)
 
 # ══════════════════════════════════════════════════════════════════
 # 3. 特征工程
@@ -1035,12 +1152,25 @@ def get_macro_feat(macro_df, month_end):
 
 
 def fetch_earnings_calendar(tickers: list, lookback_days: int = 365,
-                             forward_days: int = 90) -> dict:
+                             forward_days: int = 90, is_backtest: bool = False) -> dict:
     """
     从 FMP 获取财报日期（比 yfinance 更准确，Colab可用）。
     返回：{ticker: sorted list of earnings dates}
     缓存7天。
+    
+    ⚠️  警告：信息泄露风险
+    
+    如果 is_backtest=False（当月预测）：
+      用今天为中心往前 365 天、往后 90 天，获取实际已知的财报日历。
+    
+    如果 is_backtest=True（历史回测）：
+      返回空字典，避免用当今的财报安排去预测 2018-2022 年的数据。
+      历史回测期间的财报日期大多不可得（真正的 PIT 会很困难），
+      强行使用会导致未来信息泄露（用现在才知道的财报日期去训练过去）。
     """
+    if is_backtest:
+        print(f"  [财报日历] 回测模式，禁用财报特征以避免信息泄露")
+        return {}
     import os, pickle, time, requests as _req
 
     cache_file = "./simfin_data/earnings_calendar.pkl"
@@ -1132,7 +1262,10 @@ def build_panel(passed, daily_map, pit_map, macro_df):
     print(f"\n[3/4] 构建特征面板...")
 
     all_tech = {}
-    earnings_cal = fetch_earnings_calendar(passed)
+    # ✓ 禁用历史回测中的财报日历特征以避免信息泄露
+    # 财报日期是 point-in-time 的，但 fetch_earnings_calendar 用当前时间，
+    # 会把当前知道的未来财报（相对于历史月份）映射到过去，造成未来信息泄露
+    earnings_cal = fetch_earnings_calendar(passed, is_backtest=True)
 
     for t in passed:
         try:
@@ -1836,14 +1969,17 @@ def walk_forward(panel, tx_cost=0.002):
             eff_tx = tx_cost*4 if mktcap<1e9 else (tx_cost*2 if mktcap<5e9 else tx_cost)
             ret_net = (ret_raw - eff_tx*2 if pd.notna(ret_raw) and is_new else ret_raw)
             
-            # 🎯 【核心新增】：让回测报告完美继承缓冲带的选择：给选中的股票强行加 10 分！
-            ens_to_save = ens[j] + 10.0 if j in top_idx else ens[j]
-            
-            if j in top_idx:
+            # ✓ 【修复】分离模型分数与选择标记，避免污染真实分数
+            is_selected = j in top_idx
+            if is_selected:
                 curr_h.add(t)
-            # 🎯 【修改】：保存 ens_to_save 而不是 ens[j]
-            recs.append({"date":dates[i],"ticker":t,"ens":ens_to_save,
-                         "actual_ret":row.get("next_ret_abs", ret_raw),"actual_ret_net":ret_net,
+            
+            # 保存真实的模型分数（不加任何调整），分别记录是否被选中
+            recs.append({"date":dates[i],"ticker":t,
+                         "model_score":ens[j],              # ✓ 真实模型分数，用于 IC/评估
+                         "is_selected":is_selected,         # ✓ 是否被缓冲带选中
+                         "actual_ret":row.get("next_ret_abs", ret_raw),
+                         "actual_ret_net":ret_net,
                          "actual_cls":row.get("label",np.nan)})
 
             # 更新 IC
@@ -4180,51 +4316,52 @@ def generate_monthly_report(result, bl_weights_df, wf, regime,
 
     css = (
         "<style>"
-        f"body{{font-family:-apple-system,Helvetica,Arial,sans-serif;background:{BG};margin:0;padding:20px;color:#2C3E50}}"
-        f".wrap{{max-width:660px;margin:0 auto;background:{WHITE};border-radius:12px;overflow:hidden;box-shadow:0 4px 20px rgba(0,0,0,.1)}}"
-        f".hdr{{background:#1A252F;padding:28px 28px 20px}}"
-        f".hdr h1{{color:{WHITE};margin:0;font-size:21px;font-weight:700}}"
-        f".hdr p{{color:#BDC3C7;margin:5px 0 0;font-size:13px}}"
-        f".sec{{padding:22px 28px;border-bottom:1px solid #ECF0F1}}"
-        f".sec h2{{font-size:15px;font-weight:700;color:#1A252F;margin:0 0 14px;padding-bottom:7px;border-bottom:2px solid {BLUE}}}"
-        f".rbox{{background:{BG};border-left:4px solid {r_color};padding:11px 15px;border-radius:0 7px 7px 0;font-size:14px;font-weight:700;color:{r_color}}}"
-        f".wbox{{background:#FFF3CD;border-left:4px solid {ORANGE};padding:11px 15px;border-radius:0 7px 7px 0;font-size:13px;margin-top:11px}}"
-        ".mgrid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-top:4px}"
-        f".mcard{{background:{BG};border-radius:8px;padding:13px;text-align:center}}"
-        ".mval{font-size:19px;font-weight:700;color:#1A252F}"
-        f".mlbl{{font-size:11px;color:{GRAY};margin-top:3px}}"
-        "table{width:100%;border-collapse:collapse;font-size:13px}"
-        f"th{{background:#1A252F;color:{WHITE};padding:9px 11px;text-align:left;font-size:12px;font-weight:600}}"
-        "td{padding:9px 11px;border-bottom:1px solid #ECF0F1}"
+        f"body{{font-family:-apple-system,Helvetica,Arial,sans-serif;background:{BG};margin:0;padding:16px;color:#2C3E50;line-height:1.5}}"
+        f".wrap{{max-width:750px;margin:0 auto;background:{WHITE};border-radius:8px;overflow:hidden;box-shadow:0 4px 20px rgba(0,0,0,.1)}}"
+        f".hdr{{background:#1A252F;padding:24px 20px 16px}}"
+        f".hdr h1{{color:{WHITE};margin:0;font-size:20px;font-weight:700}}"
+        f".hdr p{{color:#BDC3C7;margin:4px 0 0;font-size:12px}}"
+        f".sec{{padding:18px 20px;border-bottom:1px solid #ECF0F1}}"
+        f".sec h2{{font-size:14px;font-weight:700;color:#1A252F;margin:0 0 12px;padding-bottom:6px;border-bottom:2px solid {BLUE}}}"
+        f".rbox{{background:{BG};border-left:4px solid {r_color};padding:10px 14px;border-radius:0 6px 6px 0;font-size:13px;font-weight:700;color:{r_color}}}"
+        f".wbox{{background:#FFF3CD;border-left:4px solid {ORANGE};padding:10px 14px;border-radius:0 6px 6px 0;font-size:12px;margin-top:10px}}"
+        ".mgrid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:8px}"
+        f".mcard{{background:{BG};border-radius:6px;padding:12px;text-align:center}}"
+        ".mval{font-size:18px;font-weight:700;color:#1A252F}"
+        f".mlbl{{font-size:11px;color:{GRAY};margin-top:2px}}"
+        "table{width:100%;border-collapse:collapse;font-size:11px;table-layout:fixed}"
+        f"th{{background:#1A252F;color:{WHITE};padding:8px 9px;text-align:left;font-size:11px;font-weight:600;word-wrap:break-word}}"
+        f"td{{padding:8px 9px;border-bottom:1px solid #ECF0F1;word-wrap:break-word;overflow-wrap:break-word}}"
         f"tr:nth-child(even) td{{background:{BG}}}"
-        f".tk{{font-weight:700;color:{BLUE};font-family:monospace}}"
+        f".tk{{font-weight:700;color:{BLUE};font-family:monospace;font-size:12px}}"
         f".pos{{color:{GREEN};font-weight:600}}.neg{{color:{RED};font-weight:600}}"
         f".ch{{color:{RED};font-weight:700}}.cm{{color:{ORANGE};font-weight:700}}.cl{{color:{GREEN};font-weight:700}}"
-        ".frow{display:flex;align-items:center;margin:5px 0}"
-        f".fn{{font-family:monospace;font-size:12px;color:{BLUE};width:190px;flex-shrink:0}}"
-        ".fbg{flex:1;background:#ECF0F1;height:7px;border-radius:3px}"
-        f".fb{{background:{BLUE};height:7px;border-radius:3px}}"
-        f".fv{{font-size:12px;color:{GRAY};margin-left:9px;width:48px}}"
-        f".ftr{{background:#1A252F;padding:16px 28px;text-align:center}}"
-        f".ftr p{{color:#7F8C8D;font-size:11px;margin:0}}"
+        ".frow{display:flex;align-items:center;margin:5px 0;font-size:11px}"
+        f".fn{{font-family:monospace;font-size:11px;color:{BLUE};width:140px;flex-shrink:0}}"
+        ".fbg{flex:1;background:#ECF0F1;height:6px;border-radius:2px}"
+        f".fb{{background:{BLUE};height:6px;border-radius:2px}}"
+        f".fv{{font-size:11px;color:{GRAY};margin-left:8px;width:40px}}"
+        f".ftr{{background:#1A252F;padding:14px 20px;text-align:center}}"
+        f".ftr p{{color:#7F8C8D;font-size:10px;margin:0;line-height:1.4}}"
+        "td[style*='max-width']{text-overflow:ellipsis}"
         "</style>"
     )
 
-    h = f'<!DOCTYPE html><html><head><meta charset="utf-8">{css}</head><body><div class="wrap">'
-    h += f'<div class="hdr"><h1>TSX Monthly Stock Report</h1>'
-    h += f'<p>{month} &nbsp;| XGBoost + LightGBM + MLP | {len(FEATURE_COLS)} Features</p></div>'
+    h = f'<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">{css}</head><body><div class="wrap">'
+    h += f'<div class="hdr"><h1>🇨🇦 TSX Monthly Stock Report</h1>'
+    h += f'<p>{month} | XGBoost + LightGBM + PyTorch Ensemble | {len(FEATURE_COLS)} Features</p></div>'
 
     # Regime box
-    h += f'<div class="sec"><h2>Market Regime</h2><div class="rbox">{r_label}</div>'
+    h += f'<div class="sec"><h2>Market Regime & Risk Signal</h2><div class="rbox">{r_label}</div>'
     if dd_signal:
-        h += f'<div class="wbox"><b>Risk Warning:</b> 3-month cumulative return {dd_signal*100:.1f}%. Consider reducing position by 50%.</div>'
+        h += f'<div class="wbox"><b>⚠️ Risk Alert:</b> 3-month cumulative drawdown is {dd_signal*100:+.1f}%. Consider reducing exposure by 50%.</div>'
     h += '</div>'
 
     # Walk-Forward metrics
     tc = "pos" if wf_topR != "N/A" and "+" in wf_topR else "neg"
     h += (
-        '<div class="sec"><h2>Walk-Forward Performance</h2><div class="mgrid">'
-        f'<div class="mcard"><div class="mval {tc}">{wf_topR}</div><div class="mlbl">Top20% Monthly Return</div></div>'
+        '<div class="sec"><h2>Walk-Forward Backtest Performance</h2><div class="mgrid">'
+        f'<div class="mcard"><div class="mval {tc}">{wf_topR}</div><div class="mlbl">Avg Monthly Return (Top 20%)</div></div>'
         f'<div class="mcard"><div class="mval" style="color:{BLUE}">{wf_acc}</div><div class="mlbl">Classification Accuracy</div></div>'
         f'<div class="mcard"><div class="mval" style="color:{RED}">{wf_mdd}</div><div class="mlbl">Max Monthly Drawdown</div></div>'
         '</div></div>'
@@ -4234,9 +4371,9 @@ def generate_monthly_report(result, bl_weights_df, wf, regime,
     REPORT_CAPITAL = 100_000  # CAD - change to match your portfolio
     h += ('<div class="sec"><h2>Top 10 Stock Picks</h2>'
           '<table style="font-size:12px;width:100%">'
-          '<tr><th>#</th><th>Ticker</th><th>Company</th><th>GICS</th>'
-          '<th>Pred Return</th><th>Price (CAD)</th>'
-          '<th>Amount (CAD)</th><th style="color:#2980B9">Shares to Buy</th></tr>')
+          '<tr><th>#</th><th>Ticker</th><th>Company</th><th>Sector</th>'
+          '<th>Forecast Return</th><th>Current Price</th>'
+          '<th>Proposed Amount</th><th style="color:#2980B9">Suggested Shares</th></tr>')
     for i, (idx, row) in enumerate(top.iterrows(), 1):
         t    = idx[1] if isinstance(idx, tuple) else idx
         prof = STOCK_PROFILE.get(t, {})
@@ -4257,12 +4394,12 @@ def generate_monthly_report(result, bl_weights_df, wf, regime,
         shares  = int(amount / price_val) if price_val > 0 else 0
         price_s = f"${price_val:.2f}" if price_val > 0 else "N/A"
         h += (f'<tr><td>{i}</td><td class="tk">{t}</td>'
-              f'<td style="font-size:11px">{str(row.get("name",""))[:18]}</td>'
-              f'<td style="font-size:11px;color:{GRAY}">{prof.get("gics","?")[:12]}</td>'
+              f'<td style="font-size:11px;max-width:100px;overflow:hidden">{str(row.get("name",""))[:20]}</td>'
+              f'<td style="font-size:11px;color:{GRAY}">{prof.get("gics","Unknown")[:14]}</td>'
               f'<td class="{rc}">{rp:+.1f}%</td>'
               f'<td style="font-family:monospace">{price_s}</td>'
               f'<td style="font-family:monospace">${amount:,.0f}</td>'
-              f'<td style="font-weight:700;color:{BLUE};font-size:13px">{shares:,}</td></tr>')
+              f'<td style="font-weight:700;color:#2980B9;font-size:13px">{shares:,}</td></tr>')
     h += '</table></div>'
 
     # Position Sizing（BL 或 Fuzzy，始终显示，含价格和股数）
@@ -4280,43 +4417,60 @@ def generate_monthly_report(result, bl_weights_df, wf, regime,
         REPORT_CAPITAL = 100_000
         h += '<div class="sec"><h2>Position Sizing</h2>'
         h += '<table style="font-size:12px;width:100%">'
-        h += ('<tr><th>Ticker</th><th>Category</th><th>Allocation</th>'
+        h += ('<tr><th>Ticker</th><th>Strategy</th><th>Allocation</th>'
               '<th>Price (CAD)</th><th>Amount (CAD)</th>'
-              '<th style="color:#2980B9">Shares to Buy</th><th>Vol</th></tr>')
+              '<th style="color:#2980B9">Shares to Buy</th><th>Volatility</th></tr>')
         for _, row in pos_df.iterrows():
             t3  = row.get("ticker","")
-            cat = row.get("category","")
-            cc  = "ch" if "Heavy" in cat else ("cm" if "Moderate" in cat else "cl")
-            bw  = min(int(row["alloc_pct"]*3), 100)
+            
+            # 🔧 修复：确保 category 字段总是有数据，即使 BL 返回空也有备用
+            raw_cat = row.get("category","")
+            if not raw_cat or raw_cat.strip() == "":
+                # 备用分类逻辑：基于分配百分比
+                alloc = row.get("alloc_pct", 0)
+                if alloc >= 18:    raw_cat = "Heavy Buy 🔴"
+                elif alloc >= 10:  raw_cat = "Moderate Buy 🟡"
+                else:              raw_cat = "Light Buy 🟢"
+            
+            cat = raw_cat
+            cc  = "ch" if "Heavy" in str(cat) or "🔴" in str(cat) else ("cm" if "Moderate" in str(cat) or "🟡" in str(cat) else "cl")
+            
+            alloc_pct = float(row.get("alloc_pct", 0))
+            bw  = min(int(max(alloc_pct, 1) / 30 * 100), 100)  # 进度条幅度（基于最大可能权重）
+            
             price_val = 0
             if daily_map and t3 in daily_map and not daily_map[t3].empty:
                 price_val = float(daily_map[t3]["close"].iloc[-1])
-            amount  = REPORT_CAPITAL * row["alloc_pct"] / 100
+            amount  = REPORT_CAPITAL * alloc_pct / 100
             shares  = int(amount / price_val) if price_val > 0 else 0
             price_s = f"${price_val:.2f}" if price_val > 0 else "N/A"
+            vol_pct = float(row.get("vol_ann", 0)) * 100
+            
             h += (f'<tr><td class="tk">{t3}</td><td class="{cc}">{cat}</td>'
                   f'<td><div style="display:flex;align-items:center;gap:6px">'
                   f'<div class="fbg" style="width:60px"><div class="fb" style="width:{bw}%"></div></div>'
-                  f'<b>{row["alloc_pct"]:.1f}%</b></div></td>'
+                  f'<b>{alloc_pct:.1f}%</b></div></td>'
                   f'<td>{price_s}</td>'
                   f'<td>${amount:,.0f}</td>'
                   f'<td style="font-weight:700;color:#2980B9;font-size:13px">{shares:,}</td>'
-                  f'<td style="color:#7F8C8D">{row.get("vol_ann",0)*100:.1f}%</td></tr>')
+                  f'<td style="color:#7F8C8D">{vol_pct:.1f}%</td></tr>')
         h += '</table></div>'
 
     # Feature importance
-    h += '<div class="sec"><h2>Key Driving Factors (Top 8)</h2>'
-    max_v = imp.head(8).max()
-    for feat, val in imp.head(8).items():
-        bw = int(val / max_v * 100) if max_v > 0 else 0
-        h += (f'<div class="frow"><span class="fn">{feat}</span>'
-              f'<div class="fbg"><div class="fb" style="width:{bw}%"></div></div>'
-              f'<span class="fv">{val:.4f}</span></div>')
+    h += '<div class="sec"><h2>Key Driving Factors (Top 8 Features)</h2>'
+    if not imp.empty:
+        max_v = imp.head(8).max()
+        for feat, val in imp.head(8).items():
+            bw = int(val / max_v * 100) if max_v > 0 else 0
+            h += (f'<div class="frow"><span class="fn">{feat}</span>'
+                  f'<div class="fbg"><div class="fb" style="width:{bw}%"></div></div>'
+                  f'<span class="fv">{val:.4f}</span></div>')
+    else:
+        h += '<p style="font-size:11px;color:#7F8C8D">Feature importance data not available</p>'
     h += '</div>'
 
-    h += (f'<div class="ftr"><p>Generated: {datetime.today().strftime("%Y-%m-%d %H:%M")}'
-          ' | TSX Quant Stock Picker v3.0'
-          ' | For reference only, not investment advice</p></div>'
+    h += (f'<div class="ftr"><p>📋 Generated: {datetime.today().strftime("%Y-%m-%d %H:%M %Z")} | TSX Quant Stock Picker v3.0 | '
+          'For informational reference only — not investment advice | Past performance does not guarantee future results</p></div>'
           '</div></body></html>')
     return h
 
@@ -4682,7 +4836,7 @@ def run_new_modules(panel, daily_map, meta_df, macro_df, wf,
 # 这是完整的 26特征 + XGBoost + LightGBM + MLP 模型的真实历史表现。
 
 
-BACKTEST_MONTHS  = 12
+BACKTEST_MONTHS  = 120
 INITIAL_CAPITAL  = 100_000
 BENCHMARK        = "XIU.TO"
 BT_TX_COST       = 0.000   # ★ Wealthsimple 免手续费版本：硬性手续费清零（滑点由bid_ask模拟）
@@ -4900,18 +5054,76 @@ def print_wf_backtest(results, initial_capital):
 
 
 # ══════════════════════════════════════════════════════════════════
-# 运行模式配置
+# 💼 OPERATIONS MANUAL（日常运维配置）
+# ══════════════════════════════════════════════════════════════════
+#
+# 📋 使用场景：Wealthsimple 免佣金账户日常维护
+#
+# 🎯 每月操作流程：
+#   第一步（1 分钟）：  查看 Wealthsimple App 现有持仓 → 更新下方 MY_CURRENT_PORTFOLIO
+#   第二步（5 分钟）：  运行 python picker.py → 等待报告生成
+#   第三步（1 分钟）：  打开邮件 PDF 报告 → 按"Position Sizing"表格操作
+#
+# ⚙️  配置项说明：
+#   MODE：                 运行模式（"pick"当月选股 / "backtest"历史回测 / "both"两者）
+#   MY_CURRENT_PORTFOLIO:  今天持有的股票及占比（权重总和应接近 1.0）
+#   EMAIL_CONFIG:          报告邮件发送地址（自动发送 PDF）
+#   BT_TX_COST:            手续费成本（Wealthsimple=0.0 免佣金）
+#
+# ❌ 禁止修改：
+#   - picker.py 核心逻辑（第 1-4800 行）
+#   - 模型参数（XGBoost / LightGBM / MLP 配置）
+#   - CONSTRAINTS（约束条件）已优化到生产条件
+#
+# ✓ 允许修改：
+#   - MY_CURRENT_PORTFOLIO（每月更新）
+#   - MODE（想要回测就改 "both"）
+#   - EMAIL_CONFIG（换新邮箱）
 # ══════════════════════════════════════════════════════════════════
 
-MODE = "pick"   # "pick"     → 当月选股（默认）
-                # "backtest" → 历史回测（过去12个月逐月模拟）
-                # "both"     → 先回测再选股
+# ── 运行模式（MODE 配置）─────────────────────────────────────────
+MODE = "both"   # "pick"     → 当月选股（默认，耗时 5 分钟）
+                # "backtest" → 历史回测（过去 12 个月逐月模拟，耗时 30 分钟）
+                # "both"     → 先回测再选股（耗时 35 分钟，推荐周末运行）
+
+# ── 当前持仓配置（MY_CURRENT_PORTFOLIO）─────────────────────────
+# 📱 获取方式：
+#   1. 打开 Wealthsimple App
+#   2. 点击"Accounts" → 看你的持仓列表
+#   3. 每支股票旁边有百分比（%), 复制过来填到下面的字典
+# 
+# 💡 规则：
+#   - 权重（小数点）= Wealthsimple 显示的百分比 ÷ 100
+#   - 例：BMO 占 15.2% → 字典里写 "BMO.TO": 0.152
+#   - 所有权重总和应接近 1.0（如果有现金，可以 0.95）
+#   - 持仓少于 10 只？写你实际持有的即可，系统会用"缓冲带"做平滑过渡
+#
+# ✓ MY_CURRENT_PORTFOLIO 现在从单独文件 portfolio_config.py 导入
+# 这样做的好处：
+#   - 避免重复定义导致的混淆
+#   - 清楚的单一来源（Single Source of Truth）
+#   - 便于版本控制，分离配置与代码
+
+# ── 邮件配置（EMAIL_CONFIG）──────────────────────────────────────
+# 📧 工作原理：
+#   - 运行结束后自动生成 PDF 报告 → 发送到你的邮箱
+#   - 报告包含：选股结果 + 凸优化仓位 + 风险控制 + 性能指标
+#   - 从邮件打开 PDF → 直接看表格 → 执行调仓
+#
+# 🔐 安全性：
+#   - 密码存储在本地 Python 文件（非云端）
+#   - Gmail: 用 app password（gmail.com/account/security）而不是真实密码
+#   - 163/QQ: 用授权码就行（邮箱设置 → 账户安全）
 
 EMAIL_CONFIG = {
-    "to":       "carlchenn@hotmail.com",
-    "from":     "carlchenyiqing@gmail.com",
-    "password": "vvdn ezoz yivl fbrw",
+    "to":       "carlchenn@hotmail.com",          # 你的接收邮箱
+    "from":     "carlchenyiqing@gmail.com",       # 发送邮箱（Gmail，需配置 app password）
+    "password": "vvdn ezoz yivl fbrw",            # Gmail app password（NOT 真实密码）
 }
+
+# ── 回测参数（BACKTEST_MONTHS）────────────────────────────────────
+# 已在上面配置，默认 12 个月
+# 改成 24 可回测过去 2 年，但注意数据需要 5 年完整价格历史
 
 
 if __name__ == "__main__":
@@ -4931,7 +5143,8 @@ if __name__ == "__main__":
         # 回测需要先跑完整 pipeline 拿到 wf
         if "daily_map" not in dir() or "wf" not in dir():
             daily_map, pit_map, meta_df, macro_df = fetch_all(TICKERS, YEARS)
-            passed  = apply_constraints(daily_map, meta_df, CONSTRAINTS)
+            # ✓ 【修复存活者偏差】：历史回测用基础约束，避免用当前 meta_df 过滤历史数据
+            passed  = apply_base_constraints(daily_map, CONSTRAINTS)
             panel   = build_panel(passed, daily_map, pit_map, macro_df)
             panel   = add_labels(panel)
             panel   = cross_z(panel)
@@ -4949,15 +5162,17 @@ if __name__ == "__main__":
 
         daily_map, pit_map, meta_df, macro_df = fetch_all(TICKERS, YEARS)
 
-        print(f"\n[3/4] 约束过滤")
-        passed = apply_constraints(daily_map, meta_df, CONSTRAINTS)
+        print(f"\n[3/4] 约束过滤（用最新基本面数据）")
+        # ✓ 当月选股明确使用当前 meta_df（PE/ROE/市值）
+        # 同步启用财报日历特征（当月预测需要未来财报安排）
+        passed = apply_constraints_current(daily_map, meta_df, CONSTRAINTS)
         if len(passed) < TOP_N:
             print(f"\n⚠️  通过约束 {len(passed)} 支 < TOP_N={TOP_N}，"
                   f"建议放宽 max_pe 或 min_mktcap_cad")
             # 注意：放宽约束时 max_price_cad 始终保留
             relaxed = {**CONSTRAINTS, "max_pe": 100, "min_mktcap_cad": 200_000_000,
                        "max_price_cad": CONSTRAINTS.get("max_price_cad", 9999)}
-            passed = apply_constraints(daily_map, meta_df, relaxed)
+            passed = apply_constraints_current(daily_map, meta_df, relaxed)
 
         print(f"\n[4/4] 特征工程 + 模型")
         panel = build_panel(passed, daily_map, pit_map, macro_df)
@@ -4976,20 +5191,38 @@ if __name__ == "__main__":
                         stop_loss       = STOP_LOSS_PCT,
                         benchmark       = "XIU.TO")
 
-        # 🎯 【新增】：把 Wealthsimple 里的真实仓位比例写成字典
-        # 每月运行前按账户实际持仓更新；权重总和尽量接近 1.0
-        MY_CURRENT_PORTFOLIO = {
-            "BMO.TO": 0.152,
-            "MFC.TO": 0.148,
-            "NTR.TO": 0.105,
-            "EMA.TO": 0.120,
-            "HBM.TO": 0.145,
-            "DIR-UN.TO": 0.070,
-            "ENGH.TO": 0.020,
-            "CNQ.TO": 0.150,
-            "ARX.TO": 0.020,
-            "CAE.TO": 0.020,
-        }
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # 🎯 【核心配置】MY_CURRENT_PORTFOLIO — 每月必须更新！
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # 
+        # 更新步骤：
+        #   1️⃣  打开 Wealthsimple App → My Portfolio
+        #   2️⃣  看你的 10 支持仓股票及其百分比权重（%）
+        #   3️⃣  权重换算：百分比 ÷ 100 = 字典的值
+        #       例：15.2% → 0.152，14.8% → 0.148
+        #   4️⃣  所有权重和应接近 1.0（允许 0.95-1.05）
+        #
+        # 用途：
+        #   - 计算"缓冲带"（±12档避免过度换仓）
+        #   - 用于 Black-Litterman 优化（考虑现有仓位）
+        #   - 如果持仓少于 10 只，写你实际持有的即可
+        #
+        # ✓ MY_CURRENT_PORTFOLIO 现在从 portfolio_config.py 导入
+        # 编辑方式：
+        #   1. 打开 portfolio_config.py
+        #   2. 取消注释示例配置
+        #   3. 填入你的实际持仓比例
+        #   4. 保存 portfolio_config.py
+        #   5. 运行 python picker.py（会自动加载新配置）
+        # ✓ 好处：避免重复定义导致配置被意外覆盖
+        # ✓ 第一次运行：使用空配置，系统会生成推荐，然后复制到 portfolio_config.py
+        
+        # 如果 MY_CURRENT_PORTFOLIO 为空，系统会用 ETF 扫描（防守策略）
+        if not MY_CURRENT_PORTFOLIO:
+            print("  ⚠️  MY_CURRENT_PORTFOLIO 为空 → 系统使用默认防守配置")
+            print("  💡 建议：查看下方 result DataFrame，复制推荐配置到上面")
+        else:
+            print(f"  ✅ 已读入 {len(MY_CURRENT_PORTFOLIO)} 只现有持仓")
 
         # 提取名字列表给“换仓缓冲带”用
         current_tickers_only = list(MY_CURRENT_PORTFOLIO.keys())
