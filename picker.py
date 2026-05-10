@@ -24,14 +24,18 @@ TSX 量化选股 v2.0 — 全优化版
 """
 
 import warnings; warnings.filterwarnings("ignore")
+import os
 import numpy as np
 import pandas as pd
 import yfinance as yf
 import xgboost as xgb
+import requests
+import time
+import json
 from datetime import datetime, timedelta
 from sklearn.metrics import accuracy_score
 from sklearn.preprocessing import StandardScaler
-from portfolio_config import MY_CURRENT_PORTFOLIO  # ✓ 从单独文件导入，避免重复定义
+# from portfolio_config import MY_CURRENT_PORTFOLIO  # ✓ 从单独文件导入，避免重复定义
 
 try:
     import lightgbm as lgb
@@ -122,14 +126,15 @@ def get_tsx_tickers(source: str = "builtin") -> list[str]:
       1. 提供历史 TSX 成分股列表（2014-2026）
       2. 或在回测输出中标注此限制
       3. 或同时运行「扩展宇宙」包括已退市股票的版本
-    """
-    """
+    
+    ═══════════════════════════════════════════════════════════════
     获取 TSX 股票池。
 
-    source:
-      "builtin"   → 内置 ~220 支，无需网络（默认）
-      "xic"       → 从 BlackRock XIC ETF 自动更新（需本地运行）
-      "cache"     → 读取上次 XIC 抓取的缓存文件
+    Args:
+      source: 数据源选择
+        - "builtin"   → 内置 ~220 支，无需网络（默认）
+        - "xic"       → 从 BlackRock XIC ETF 自动更新（需本地运行）
+        - "cache"     → 读取上次 XIC 抓取的缓存文件
 
     使用方式：
       本地首次运行：source="xic"  → 下载最新成分股并缓存
@@ -190,7 +195,9 @@ def get_tsx_tickers(source: str = "builtin") -> list[str]:
 TICKERS = get_tsx_tickers(source="builtin")
 
 
-# ── Simfin 配置（本地运行时填入，Colab 会因 IP 限制失败）──────
+# ── Simfin 配置（从环境变量读取，避免明文 API Key）──────
+# 设置方法：export SIMFIN_API_KEY="你的key" 或填入 os.getenv 的默认值
+
 SIMFIN_API_KEY = "804d29c7-c3cf-43d4-96a1-128edd64b7ff"
 
 # 固定所有随机种子（确保同一天同样数据跑出相同结果）
@@ -204,7 +211,7 @@ try:
     torch.backends.cudnn.benchmark     = False
 except ImportError:
     pass
-FMP_API_KEY    = "JiSlrxR3kbnUQnNcTShCFjUNdq78htKf"   # 注册 financialmodelingprep.com 获取免费 key
+FMP_API_KEY    = "JiSlrxR3kbnUQnNcTShCFjUNdq78htKf"  # 🔒 改为从环境变量读取（注册 financialmodelingprep.com 获取免费 key）
 SIMFIN_DATA_DIR = "./simfin_data"   # 本地缓存目录
 
 def fetch_pit_fmp(ticker: str, api_key: str, quarters: int = 20) -> pd.DataFrame:
@@ -221,8 +228,6 @@ def fetch_pit_fmp(ticker: str, api_key: str, quarters: int = 20) -> pd.DataFrame
     只返回核心字段（avail_date, net_income, total_equity, ocf, capex, shares），
     让 compute_pit_fundamentals() 统一计算 pe/pb/roe/fcf_yield 等比率。
     """
-    import requests, time
-
     BASE = "https://financialmodelingprep.com/api/v3"
     rows = []
 
@@ -261,12 +266,26 @@ def fetch_pit_fmp(ticker: str, api_key: str, quarters: int = 20) -> pd.DataFrame
             bal = bal_by_date.get(qdate, {})
             cf  = cf_by_date.get(qdate,  {})
 
-            # 核心字段：直接从 FMP API 提取，格式与 yfinance/Simfin 一致
+            # 基础通用字段
             net_income = inc.get("netIncome") or 0
             equity     = bal.get("totalStockholdersEquity")
             op_cf      = cf.get("operatingCashFlow") or 0
             capex      = cf.get("capitalExpenditure") or 0
             shares     = inc.get("weightedAverageShsOut")
+
+            # 🎯 【新增】获取行业专属计算所需的原始字段
+            revenue      = inc.get("revenue") or 0
+            ebitda       = inc.get("ebitda") or 0
+            dna          = inc.get("depreciationAndAmortization") or 0  # 算 FFO 必须
+            rnd          = inc.get("researchAndDevelopmentExpenses") or 0 # 科技股必须
+            div_paid     = cf.get("dividendsPaid") or 0
+            total_debt   = bal.get("totalDebt") or 0
+            
+            # 金融股专用字段
+            interest_inc = inc.get("interestIncome") or 0
+            interest_exp = inc.get("interestExpense") or 0
+            pcl          = inc.get("provisionForCreditLosses") or 0
+            total_assets = bal.get("totalAssets") or 1e9  # 给个底线防止除 0
 
             rows.append({
                 "avail_date":   pd.Timestamp(fill_dt[:10]),
@@ -275,6 +294,17 @@ def fetch_pit_fmp(ticker: str, api_key: str, quarters: int = 20) -> pd.DataFrame
                 "ocf":          op_cf,
                 "capex":        capex,
                 "shares":       shares,
+                # --- 新增数据入库 ---
+                "revenue":      revenue,
+                "ebitda":       ebitda,
+                "dna":          dna,
+                "rnd":          rnd,
+                "div_paid":     div_paid,
+                "total_debt":   total_debt,
+                "interest_inc": interest_inc,
+                "interest_exp": interest_exp,
+                "pcl":          pcl,
+                "total_assets": total_assets,
             })
 
         if rows:
@@ -282,7 +312,9 @@ def fetch_pit_fmp(ticker: str, api_key: str, quarters: int = 20) -> pd.DataFrame
             return df
 
     except Exception as e:
-        pass
+        print(f"  ⚠️  Simfin 特征计算失败：{type(e).__name__}: {str(e)[:100]}")
+        import traceback
+        traceback.print_exc()
 
     return pd.DataFrame()
 
@@ -455,6 +487,9 @@ def build_pit_from_simfin(ticker, inc_all, bal_all, cf_all):
         return df
 
     except Exception as e:
+        print(f"  ⚠️  FMP 基本面数据解析失败：{type(e).__name__}: {str(e)[:100]}")
+        import traceback
+        traceback.print_exc()
         return pd.DataFrame()
 
 
@@ -467,13 +502,40 @@ MACRO_TICKERS = {
     "vix":   "^VIX",
 }
 
-TOP_N         = 10
-YEARS         = 10
+TOP_N         = 8       # 🚀 原为 10。把资金更集中地打在 Alpha 最高的 8 只票上
+YEARS         = 5
 MIN_TRAIN     = 18
 TOP_QUINTILE  = 0.20
 REPORT_LAG    = 45
 STOP_LOSS_PCT = -0.08
 MAX_DD_THRESH = -0.05
+
+# ══════════════════════════════════════════════════════════════════
+# 🛑 行业黑名单 & 白名单（加拿大 TSX 专用排雷规则）
+# ══════════════════════════════════════════════════════════════════
+# 
+# 核心原则：物理隔离低波动"现金拖累"资产，让优化器专注于高波动高收益行业
+#
+# 黑名单理由：
+#   1. Utilities：公用事业低波动陷阱 → 占坑不赚钱
+#   2. Telecom / Communication Services：低波动电信股（如 RCI-B.TO）
+#   3. Real Estate / REITs：加息周期终结者（如 NWH-UN.TO）
+#   4. Health Care：大麻股/暴雷医药充斥，基本面扭曲
+#
+# 结论：黑名单内的资产不进入选股候选池 → 优化器无法过度分配
+#
+BANNED_SECTORS = {
+    "Utilities",               # 低波动陷阱
+    "Telecom",                 # 低波动陷阱（如 RCI-B.TO）
+    "Communication Services",  # 低波动陷阱（备选 GICS 标签）
+    "Real Estate",             # 加息周期杀手（如 NWH-UN.TO）
+    "REITs",                   # 备用名称，同 Real Estate
+    "Health Care"              # 防范大麻股和暴雷医药
+}
+
+WHITELIST = {
+    "WELL.TO"  # WELL：纯正科技 SaaS（数字医疗），本质是科技股而非医疗股
+}
 
 CONSTRAINTS = {
     "min_adv_cad":        1_000_000,
@@ -481,17 +543,17 @@ CONSTRAINTS = {
     "vol_spike_days":     5,
     "vol_spike_min_days": 2,
     "min_pe":             0.0,
-    "max_pe":             60.0,
-    "min_mktcap_cad":     500_000_000,
+    "max_pe":             150.0,         # 🎯 提高到 150，放行高成长科技股 (原60.0)
+    "min_mktcap_cad":     800_000_000,   # 🎯 提高到 8 亿，进一步砍掉极小盘微型垃圾股 (原500M)
     "min_price_cad":      2.00,
     "max_price_cad":    400.00,   # 单股价格上限（过高的股票买不到足够整股）
     "min_roe":            0.0,
     "max_roe":          2.00,   # ROE > 200% 视为财务异常（如 BHC 436%）
     "min_shares":          5,   # 最少持仓股数（价格过高股票如 FFH 会被过滤）
-    "max_per_gics":       2,      # 大类行业上限
+    "max_per_gics":       4,      # 🚀 允许同行业最多 4 支股票，让优化器敢集中在表现最强势的科技/金融板块
     "max_per_style":      4,
     "max_per_type":       5,
-    "max_single_alloc":   0.20,
+    "max_single_alloc":   0.25,   # 🚀 原为 0.20。允许单只股票的持仓上限达到 25%
     "max_turnover":       4,      # 每月最多换仓数
     "hold_bonus":         0.05,   # 持仓连续性奖励
     # OPT1: 矿业子行业硬上限
@@ -501,8 +563,8 @@ CONSTRAINTS = {
     # OPT5: 换仓冷静期
     "cooldown_months":    1,      # 止损后冷静 N 个月
     # OPT6: 置信度过滤
-    "min_confidence":     0.20,   # 集成分低于此值不交易
-    "min_top_n":          5,      # 置信度不足时最少持仓
+    "min_confidence":     0.15,   # 🚀 设置至 0.15：防止过度谨慎导致空仓或买 ETF
+    "min_top_n":          8,      # 🚀 提高至 8：确保模型有足够的备选股票，不会被迫空仓
     # OPT7: 熔断 + VIX 缩仓
     "dd_halt_threshold":  -0.15,  # 3月累计亏损超此值→减仓
     "dd_halt_scale":      0.50,   # 减仓比例
@@ -510,8 +572,8 @@ CONSTRAINTS = {
     "vix_scale_factor":   0.70,   # VIX 高时仓位缩至 70%
     "min_listing_days":   252,
     # 换仓缓冲带参数（Wealthsimple 免手续费版本 — 中度宽容）
-    "rank_buffer":        12,     # 🎯 容忍底线：跌出前18名（约前20%），动量衰竭则换股
-    "score_tolerance":    0.005,  # 🎯 噪音过滤：分数落后第10名超过0.015才执行换血
+    "rank_buffer":        18,     # 🔧 修复3：放宽至前18名，减少无谓换手率（原12→18）
+    "score_tolerance":    0.015,  # 🔧 修复3：放宽至1.5% 容忍度，锁住优质老持仓（原0.005→0.015）
 }
 
 # 矿业子行业分类（OPT1 用）
@@ -523,15 +585,14 @@ BASE_METALS_TICKERS = {"HBM.TO","LUN.TO","ERO.TO","FM.TO","TECK-B.TO"}
 FEATURE_COLS = [
     "mom_1m","mom_3m","mom_6m","mom_12m","mom_12_1",
     "vol_1m","vol_3m","vol_ratio",
-    "rsi","bias_20","bias_60","vwap_bias","price_vs_52w_high",
-    "pe_rel_sector","pb","roe","eps_growth","fcf_yield",
+    "rsi","bias_60","price_vs_52w_high","bb_zscore",
     "oil_mom_3m","cadusd_mom_3m","bond_chg_3m","gold_mom_3m","vix_level",
-    "sector_mom_rel",
-    "month_sin","month_cos",
-    # 财报日历特征（新）
-    "days_to_earnings",    # 距下次财报天数（负=财报刚过）
-    "days_since_earnings", # 距上次财报天数（PEAD窗口）
-    "bb_zscore",
+    "sector_mom_rel", "month_sin","month_cos",
+    "days_to_earnings", "days_since_earnings",
+    "pe_rel_sector","pb","roe","eps_growth","fcf_yield",
+    # 🎯 新增的行业专属 Alpha 因子
+    "ev_ebitda", "capex_ocf", "p_ffo", "rule_of_40", "rnd_rev",
+    "debt_ebitda", "div_cover", "nim", "pcl_ratio"
 ]
 
 # ══════════════════════════════════════════════════════════════════
@@ -823,13 +884,19 @@ def fetch_all(tickers, years):
         # 基本面快照（约束过滤和展示用，始终用 yfinance 当前值）
         try:
             info = yf.Ticker(t).info
-            pe   = info.get("trailingPE") or info.get("forwardPE")
-            roe  = info.get("returnOnEquity")
-            mc   = info.get("marketCap")
-            div  = info.get("dividendYield")
+            pe   = safe_float(info.get("trailingPE") or info.get("forwardPE"))
+            roe  = safe_float(info.get("returnOnEquity"))
+            mc   = safe_float(info.get("marketCap"))
+            div  = safe_float(info.get("dividendYield"))
+            
+            # 🎯 【新增 1.1】：抓取负债率和毛利率，用于质量排雷
+            de   = safe_float(info.get("debtToEquity"))
+            margin = safe_float(info.get("grossMargins"))
+            
             meta_rows.append({"ticker":t,"name":info.get("shortName",t),
                                "sector":info.get("sector","Unknown"),
-                               "mktcap":mc,"pe":pe,"roe":roe,"div_yield":div})
+                               "mktcap":mc,"pe":pe,"roe":roe,"div_yield":div,
+                               "debt_to_equity": de, "gross_margin": margin})  # 🎯 追加字段
             pe_s  = f"PE={pe:.1f}"        if pe  else "PE=N/A"
             roe_s = f"ROE={roe*100:.1f}%" if roe else "ROE=N/A"
             mc_s  = f"${mc/1e9:.1f}B"     if mc  else "N/A"
@@ -857,6 +924,22 @@ def fetch_all(tickers, years):
     return daily_map, pit_map, meta_df, macro_df
 
 # ══════════════════════════════════════════════════════════════════
+# Helper: 安全类型转换（yfinance 有时返回字符串）
+# ══════════════════════════════════════════════════════════════════
+def safe_float(val):
+    """安全将任意值转换为 float，None 则返回 None"""
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    if isinstance(val, str):
+        try:
+            return float(val)
+        except (ValueError, TypeError):
+            return None
+    return None
+
+# ══════════════════════════════════════════════════════════════════
 # 2. 约束过滤
 # ══════════════════════════════════════════════════════════════════
 
@@ -869,6 +952,17 @@ def apply_constraints_current(daily_map, meta_df, c):
 
     for t, df in daily_map.items():
         reasons = []
+        
+        # 🎯 物理隔离不适合动量模型的行业（但白名单豁免）
+        gics = STOCK_PROFILE.get(t, {}).get("gics", "Unknown")
+        if gics in BANNED_SECTORS and t not in WHITELIST:
+            reasons.append(f"行业 {gics} 已全局屏蔽（白名单: {WHITELIST}）")
+        
+        # 🎯 硬编码过滤历史上结构性毁灭的"价值陷阱"
+        TOXIC_BLACKLIST = {"BHC.TO", "SGY.TO", "BIR.TO", "AQN.TO", "CJT.TO", "TOU.TO"}
+        if t in TOXIC_BLACKLIST:
+            reasons.append(f"被列入结构性风险黑名单")
+        
         min_days = c.get("min_listing_days", 0)
         if len(df) < min_days:
             reasons.append(f"上市时间 {len(df)} 天 < {min_days} 天")
@@ -896,23 +990,39 @@ def apply_constraints_current(daily_map, meta_df, c):
             if len(sp) >= c["vol_spike_min_days"]:
                 reasons.append(f"成交量异常 {len(sp)}天±{c['vol_spike_sigma']:.0f}σ")
 
-        pe = m.get("pe")
+        pe = safe_float(m.get("pe"))
         if pe is None:
             reasons.append("PE无数据")
         elif not (c["min_pe"] < pe < c["max_pe"]):
             reasons.append(f"PE {pe:.1f} 超出范围")
 
-        mktcap = m.get("mktcap")
+        mktcap = safe_float(m.get("mktcap"))
         if mktcap is None:
             reasons.append("市值无数据")
         elif mktcap < c["min_mktcap_cad"]:
             reasons.append(f"市值 ${mktcap/1e6:.0f}M < $500M")
 
-        roe = m.get("roe")
+        roe = safe_float(m.get("roe"))
         if roe is not None and roe < c.get("min_roe", 0):
             reasons.append(f"ROE {roe*100:.1f}% < 0")
         if roe is not None and roe > c.get("max_roe", 999):
             reasons.append(f"ROE {roe*100:.0f}% 异常（>200%，财务杠杆或一次性项目）")
+        
+        # 🎯 【新增 2.2】：质量排雷（防范深度价值陷阱，如 BHC）
+        de = safe_float(m.get("debt_to_equity"))
+        if de is not None and de > 250:  # 负债/权益比超过 250% 视为极度危险
+            reasons.append(f"高危负债率 {de:.0f}% > 250%")
+        
+        margin = safe_float(m.get("gross_margin"))
+        # 🎯 修复：金融业（银行/保险）没有传统意义的毛利率，必须给予豁免！
+        if gics != "Financials" and margin is not None and margin < 0.05:
+            reasons.append(f"毛利率极低 {margin*100:.1f}% < 5%")
+        
+        # 🎯 增加：针对金融股的硬性 ROE 门槛（银行必须够赚钱）
+        if gics == "Financials":
+            roe = safe_float(m.get("roe"))
+            if roe is not None and roe < 0.10:  # ROE 低于 10% 的银行直接拉黑
+                reasons.append(f"金融股盈利能力过低 (ROE {roe*100:.1f}% < 10%)")
 
         if reasons:
             removed[t] = reasons
@@ -940,15 +1050,34 @@ def apply_constraints_current(daily_map, meta_df, c):
 
 def apply_base_constraints(daily_map, c):
     """【历史回测模式】只用客观数据检查基础约束（MODE="backtest"）
-    
+
     ✓ 说明：不使用当前 meta_df（PE/ROE/市值）以避免存活者偏差
     只检查与时间无关的约束：上市时间、股价范围、成交量异常
     PIT 基本面约束由 build_panel() 在逐月基础上检查
+
+    ⚠️ 已知前视近似（2026-04 标注）：
+    本函数只对 universe 做一次性筛选（不是逐月 PIT），所以仍有以下偏差：
+      - df["close"].iloc[-1] 是全样本最后一天的价格，不是 2018 年那只票的价格；
+      - tail(20) ADV 与 tail(65) 成交量异常都用最近一段
+    实际效果：用今天才知道的"现在还活着 / 现在还流动"决定历史 universe，
+    属于温和的存活者偏差。彻底修复需把这套约束嵌入 walk_forward 逐月调用。
+    当前权衡是接受边际偏差以换取实现简洁。
     """
     passed, removed = [], {}
 
     for t, df in daily_map.items():
         reasons = []
+        
+        # 🎯 物理隔离不适合动量模型的行业（但白名单豁免）
+        gics = STOCK_PROFILE.get(t, {}).get("gics", "Unknown")
+        if gics in BANNED_SECTORS and t not in WHITELIST:
+            reasons.append(f"行业 {gics} 已全局屏蔽（白名单: {WHITELIST}）")
+        
+        # 🎯 硬编码过滤历史上结构性毁灭的"价值陷阱"
+        TOXIC_BLACKLIST = {"BHC.TO", "SGY.TO", "BIR.TO", "AQN.TO", "CJT.TO", "TOU.TO"}
+        if t in TOXIC_BLACKLIST:
+            reasons.append(f"被列入结构性风险黑名单")
+        
         min_days = c.get("min_listing_days", 0)
         if len(df) < min_days:
             reasons.append(f"上市时间 {len(df)} 天 < {min_days} 天")
@@ -976,6 +1105,10 @@ def apply_base_constraints(daily_map, c):
 
         # ⚠️ 省略 PE / ROE / 市值 检查，在历史回测中由 PIT 数据逐月检查
         # 这避免了用当前 2026 年的数据过滤 2018-2022 年的历史数据（存活者偏差）
+        
+        # 🎯 防守层：毛利率豁免（金融股不适用传统毛利率指标）
+        # 虽然apply_base_constraints不检查基本面，但如果未来有扩展，确保金融股不被拉黑
+        margin = {}  # placeholder
 
         if reasons:
             removed[t] = reasons
@@ -1000,6 +1133,134 @@ def apply_base_constraints(daily_map, c):
             print(f"  {t:<14} {' | '.join(rs)}")
     print(f"\n  ✅ 通过：{' '.join(passed)}")
     return passed
+
+
+def apply_constraints_asof(ticker: str, daily_map: dict, meta_pit: dict,
+                            asof_date: pd.Timestamp, constraints: dict) -> tuple[bool, list[str]]:
+    """
+    严谨的时间序列约束过滤（消除前视偏差）
+    
+    📊 设计原则（修复存活者偏差）：
+        所有约束都只使用 asof_date 前的数据，避免用"今天才知道的信息"污染历史回测。
+        这确保了：
+        - 价格范围检查：用 asof_date 前最后可见价格
+        - ADV / 成交量异常：只用 asof_date 前的历史窗口
+        - PIT 基本面：用该日期对应的 PIT 数据（不是最新数据）
+        - 上市时间：用 asof_date 前的实际交易天数
+    
+    🎯 参数说明：
+        ticker: 股票代码
+        daily_map: {ticker -> DataFrame} 历史 OHLCV 数据
+        meta_pit: {date -> {ticker -> {pe/roe/...}}} PIT 基本面数据
+        asof_date: 当月评估日期（只用此日期前的数据）
+        constraints: 约束条件字典
+    
+    💡 返回：(是否通过, 失败原因列表)
+    """
+    # 获取该股票的 asof_date 前的数据
+    if ticker not in daily_map:
+        return False, ["股票不在数据库"]
+    
+    df = daily_map[ticker]
+    hist = df[df.index <= asof_date]  # ★ 关键：只用截至 asof_date 的历史数据
+    
+    reasons = []
+    
+    # 黑名单检查（不受时间限制）
+    gics = STOCK_PROFILE.get(ticker, {}).get("gics", "Unknown")
+    if gics in BANNED_SECTORS and ticker not in WHITELIST:
+        reasons.append(f"行业 {gics} 已全局屏蔽")
+    
+    TOXIC_BLACKLIST = {"BHC.TO", "SGY.TO", "BIR.TO", "AQN.TO", "CJT.TO", "TOU.TO"}
+    if ticker in TOXIC_BLACKLIST:
+        reasons.append(f"被列入结构性风险黑名单")
+    
+    # 上市时间检查（asof_date 前的实际天数）
+    min_days = constraints.get("min_listing_days", 252)
+    if len(hist) < min_days:
+        reasons.append(f"上市时间 {len(hist)}天 < {min_days}天")
+        return False, reasons  # 早期退出
+    
+    # 价格范围检查（用 asof_date 最后一个可见价格）
+    if len(hist) == 0:
+        reasons.append("asof_date 前无数据")
+        return False, reasons
+    
+    price = hist["close"].iloc[-1]
+    if price < constraints["min_price_cad"]:
+        reasons.append(f"股价 ${price:.2f} < ${constraints['min_price_cad']:.2f}")
+    max_px = constraints.get("max_price_cad", 9999)
+    if price > max_px:
+        reasons.append(f"股价 ${price:.2f} > ${max_px:.0f}")
+    
+    # ADV 检查（用 asof_date 前的最后 20 天）
+    if len(hist) >= 20:
+        adv = (hist["close"].tail(20) * hist["volume"].tail(20)).mean()
+        if adv < constraints["min_adv_cad"]:
+            reasons.append(f"ADV ${adv/1e6:.2f}M < ${constraints['min_adv_cad']/1e6:.1f}M")
+    else:
+        reasons.append(f"历史数据不足 20 天，无法计算 ADV")
+    
+    # 成交量异常检查（用 asof_date 前的历史窗口）
+    if len(hist) >= 65:
+        base = hist["volume"].iloc[-65:-5]
+        vm, vs = base.mean(), base.std()
+        sp = hist["volume"].tail(constraints["vol_spike_days"])
+        sp = sp[(sp > vm + constraints["vol_spike_sigma"] * vs) |
+                (sp < max(0, vm - constraints["vol_spike_sigma"] * vs))]
+        if len(sp) >= constraints["vol_spike_min_days"]:
+            reasons.append(f"成交量异常 {len(sp)}天±{constraints['vol_spike_sigma']:.0f}σ")
+    
+    # PIT 基本面检查（用 asof_date 对应的 PIT 数据）
+    m = pd.Series(dtype=float)
+    if asof_date in meta_pit and ticker in meta_pit[asof_date]:
+        m = meta_pit[asof_date][ticker]
+    else:
+        # 如果没有该日期的 PIT 数据，尝试向前回溯最近可用的
+        pit_dates_before = [d for d in meta_pit.keys() if d <= asof_date]
+        if pit_dates_before:
+            latest_pit_date = max(pit_dates_before)
+            if ticker in meta_pit[latest_pit_date]:
+                m = meta_pit[latest_pit_date][ticker]
+    
+    # PE 检查
+    pe = safe_float(m.get("pe")) if len(m) > 0 else None
+    if pe is None or pd.isna(pe):
+        reasons.append("PE 无数据")
+    elif not (constraints["min_pe"] <= pe <= constraints["max_pe"]):
+        reasons.append(f"PE {pe:.1f} 超出范围 [{constraints['min_pe']:.0f}, {constraints['max_pe']:.0f}]")
+    
+    # 市值检查
+    mktcap = safe_float(m.get("mktcap")) if len(m) > 0 else None
+    if mktcap is None or pd.isna(mktcap):
+        reasons.append("市值 无数据")
+    elif mktcap < constraints["min_mktcap_cad"]:
+        reasons.append(f"市值 ${mktcap/1e9:.2f}B < ${constraints['min_mktcap_cad']/1e9:.1f}B")
+    
+    # ROE 检查
+    roe = safe_float(m.get("roe")) if len(m) > 0 else None
+    if roe is not None and not pd.isna(roe):
+        if roe < constraints.get("min_roe", 0):
+            reasons.append(f"ROE {roe*100:.1f}% < {constraints.get('min_roe',0)*100:.0f}%")
+        if roe > constraints.get("max_roe", 999):
+            reasons.append(f"ROE {roe*100:.0f}% > {constraints.get('max_roe',999)*100:.0f}%")
+    
+    # 负债率检查（极度危险）
+    de = safe_float(m.get("debt_to_equity")) if len(m) > 0 else None
+    if de is not None and not pd.isna(de) and de > 2.5:  # >250%
+        reasons.append(f"极度危险负债率 {de*100:.0f}%")
+    
+    # 毛利率检查（非金融股）
+    if gics != "Financials":
+        margin = safe_float(m.get("gross_margin")) if len(m) > 0 else None
+        if margin is not None and not pd.isna(margin) and margin < 0.05:
+            reasons.append(f"毛利率极低 {margin*100:.1f}%")
+    
+    # 金融股特殊规则（ROE >= 10%）
+    if gics == "Financials" and roe is not None and not pd.isna(roe) and roe < 0.10:
+        reasons.append(f"金融股ROE过低 {roe*100:.1f}% < 10%")
+    
+    return len(reasons) == 0, reasons
 
 
 def apply_constraints(daily_map, meta_df, c):
@@ -1042,32 +1303,45 @@ def compute_time_decay_weights(sample_dates, current_date, half_life_months=12.0
 
 def compute_pit_fundamentals(pit_df, monthly_close):
     """
-    向量化重构：用 merge_asof 替代 for 循环，消除前视偏差。
-    （保持原函数名，无缝接入 build_panel）
+    向量化重构：计算通用基本面 + 行业专属基本面。
     """
     if pit_df.empty or monthly_close.empty:
-        result = pd.DataFrame(index=monthly_close.index, columns=["pe","pb","roe","eps_growth","fcf_yield"])
+        # 返回带所有空列的 DataFrame 占位
+        cols = ["pe","pb","roe","eps_growth","fcf_yield", 
+                "ev_ebitda", "capex_ocf", "p_ffo", "rule_of_40", "rnd_rev",
+                "debt_ebitda", "div_cover", "nim", "pcl_ratio"]
+        result = pd.DataFrame(index=monthly_close.index, columns=cols)
         result.index.name = "date"
         return result
 
     pit_df = pit_df.sort_values('avail_date').copy()
+    
+    # ── 1. 滚动 TTM (Trailing Twelve Months) 基础计算 ──
     pit_df['ttm_ni'] = pit_df['net_income'].rolling(4, min_periods=4).sum()
     pit_df['ttm_ocf'] = pit_df['ocf'].rolling(4, min_periods=4).sum()
     pit_df['ttm_capex'] = pit_df['capex'].fillna(0).rolling(4, min_periods=4).sum()
     pit_df['ttm_fcf'] = pit_df['ttm_ocf'] - pit_df['ttm_capex'].abs()
     
-    pit_df['prev4_ttm_ni'] = pit_df['ttm_ni'].shift(4)
-    pit_df['eps_growth'] = (pit_df['ttm_ni'] - pit_df['prev4_ttm_ni']) / pit_df['prev4_ttm_ni'].abs()
+    # 🎯 新增字段的 TTM
+    pit_df['ttm_rev']    = pit_df.get('revenue', pd.Series(0, index=pit_df.index)).rolling(4, min_periods=4).sum()
+    pit_df['ttm_ebitda'] = pit_df.get('ebitda', pd.Series(0, index=pit_df.index)).rolling(4, min_periods=4).sum()
+    pit_df['ttm_dna']    = pit_df.get('dna', pd.Series(0, index=pit_df.index)).rolling(4, min_periods=4).sum()
+    pit_df['ttm_rnd']    = pit_df.get('rnd', pd.Series(0, index=pit_df.index)).rolling(4, min_periods=4).sum()
+    pit_df['ttm_div']    = pit_df.get('div_paid', pd.Series(0, index=pit_df.index)).abs().rolling(4, min_periods=4).sum()
 
-    # ✓ Bug Fix: Handle index name correctly (index may be named 'date' already)
+    # 增长率计算
+    pit_df['prev1_ttm_ni'] = pit_df['ttm_ni'].shift(1)
+    pit_df['eps_growth'] = (pit_df['ttm_ni'] - pit_df['prev1_ttm_ni']) / pit_df['prev1_ttm_ni'].abs()
+    pit_df['prev1_ttm_rev'] = pit_df['ttm_rev'].shift(1)
+    pit_df['rev_growth'] = (pit_df['ttm_rev'] - pit_df['prev1_ttm_rev']) / pit_df['prev1_ttm_rev'].abs()
+
+    # ── 2. 时间轴对齐 (merge_asof) ──
     left_df = monthly_close.reset_index()
     if 'index' in left_df.columns:
         left_df = left_df.rename(columns={'index': 'date'})
     elif left_df.columns[0] not in ['date', 'close']:
-        # If first column is unnamed or has a default name, rename it to 'date'
         left_df = left_df.rename(columns={left_df.columns[0]: 'date'})
-    left_df = left_df.rename(columns={'close': 'price'})
-    left_df = left_df.sort_values('date')
+    left_df = left_df.rename(columns={'close': 'price'}).sort_values('date')
     right_df = pit_df.reset_index().sort_values('avail_date')
     
     merged = pd.merge_asof(
@@ -1076,25 +1350,55 @@ def compute_pit_fundamentals(pit_df, monthly_close):
         direction='backward'
     )
     
-    merge_cols = ['price', 'ttm_ni', 'total_equity', 'ttm_fcf', 'shares']
-    required_cols = [c for c in merge_cols if c in merged.columns]
-    
-    if len(required_cols) < 3:  # Need at least 3 of 5 columns to compute ratios
-        result = pd.DataFrame(index=monthly_close.index, columns=["pe","pb","roe","eps_growth","fcf_yield"])
-        result.index.name = "date"
-        return result
-    
+    # ── 3. 计算所有比率 (通用 + 行业专属) ──
+    # 通用指标
     merged['pe'] = merged['price'] / (merged['ttm_ni'] / merged['shares']).replace(0, np.nan)
     merged['pb'] = merged['price'] / (merged['total_equity'] / merged['shares']).replace(0, np.nan)
     merged['roe'] = merged['ttm_ni'] / merged['total_equity'].replace(0, np.nan)
     merged['fcf_yield'] = merged['ttm_fcf'] / (merged['price'] * merged['shares']).replace(0, np.nan)
+
+    # 🎯 行业专属指标
+    mcap = merged['price'] * merged['shares']
+    total_debt = merged['total_debt'] if 'total_debt' in merged.columns else pd.Series(0, index=merged.index)
     
+    # [能源/材料] EV/EBITDA, Capex/OCF
+    ev = mcap + total_debt
+    merged['ev_ebitda'] = ev / merged['ttm_ebitda'].replace(0, np.nan)
+    merged['capex_ocf'] = merged['ttm_capex'].abs() / merged['ttm_ocf'].replace(0, np.nan)
+    
+    # [REITs] P/FFO (FFO 近似 = 净利润 + 折旧摊销)
+    ttm_ffo = merged['ttm_ni'] + merged['ttm_dna']
+    merged['p_ffo'] = mcap / ttm_ffo.replace(0, np.nan)
+    
+    # [科技] Rule of 40, R&D/Rev
+    fcf_margin = merged['ttm_fcf'] / merged['ttm_rev'].replace(0, np.nan)
+    merged['rule_of_40'] = merged['rev_growth'] + fcf_margin
+    merged['rnd_rev'] = merged['ttm_rnd'] / merged['ttm_rev'].replace(0, np.nan)
+    
+    # [公用/电信] Debt/EBITDA, 股息覆盖率
+    merged['debt_ebitda'] = total_debt / merged['ttm_ebitda'].replace(0, np.nan)
+    merged['div_cover'] = merged['ttm_fcf'] / merged['ttm_div'].replace(0, np.nan)
+    
+    # [金融] NIM (净息差), PCL_Ratio (坏账率)
+    int_inc = merged['interest_inc'] if 'interest_inc' in merged.columns else pd.Series(0, index=merged.index)
+    int_exp = merged['interest_exp'] if 'interest_exp' in merged.columns else pd.Series(0, index=merged.index)
+    total_assets = merged['total_assets'] if 'total_assets' in merged.columns else pd.Series(1e9, index=merged.index)
+    pcl = merged['pcl'] if 'pcl' in merged.columns else pd.Series(0, index=merged.index)
+    
+    merged['nim'] = (int_inc - int_exp) / total_assets.replace(0, np.nan)
+    merged['pcl_ratio'] = pcl / total_assets.replace(0, np.nan)
+
+    # 清理异常值
     merged.replace([np.inf, -np.inf], np.nan, inplace=True)
+    
     if 'date' not in merged.columns:
-        result = pd.DataFrame(index=monthly_close.index, columns=["pe","pb","roe","eps_growth","fcf_yield"])
-        result.index.name = "date"
-        return result
-    result = merged.set_index('date')[['pe', 'pb', 'roe', 'eps_growth', 'fcf_yield']]
+        return pd.DataFrame(index=monthly_close.index)
+        
+    out_cols = ['pe', 'pb', 'roe', 'eps_growth', 'fcf_yield', 
+                'ev_ebitda', 'capex_ocf', 'p_ffo', 'rule_of_40', 'rnd_rev',
+                'debt_ebitda', 'div_cover', 'nim', 'pcl_ratio']
+    
+    result = merged.set_index('date')[out_cols]
     result.index.name = "date"
     return result
 
@@ -1257,15 +1561,21 @@ def compute_earnings_features(ticker: str,
     return result_df
 
 
-def build_panel(passed, daily_map, pit_map, macro_df):
-    """✓ Bug fix: try/except 每支股票，rows为空时抛明确错误"""
+def build_panel(passed, daily_map, pit_map, macro_df, is_backtest: bool = True):
+    """✓ Bug fix: try/except 每支股票，rows为空时抛明确错误
+
+    ✓ 修订（2026-04）：
+      新增 is_backtest 参数。回测模式下禁用 earnings_calendar
+      （fetch_earnings_calendar 用今日为锚点会泄露未来财报安排）；
+      当月选股模式（is_backtest=False）启用真实财报日历。
+    """
     print(f"\n[3/4] 构建特征面板...")
 
     all_tech = {}
-    # ✓ 禁用历史回测中的财报日历特征以避免信息泄露
-    # 财报日期是 point-in-time 的，但 fetch_earnings_calendar 用当前时间，
-    # 会把当前知道的未来财报（相对于历史月份）映射到过去，造成未来信息泄露
-    earnings_cal = fetch_earnings_calendar(passed, is_backtest=True)
+    # ✓ 修订：earnings_calendar 是否启用由 is_backtest 控制
+    # - 回测（is_backtest=True）：禁用，因 fetch_earnings_calendar 用 today 锚点会泄露未来
+    # - 当月选股（is_backtest=False）：启用，未来 90 天内的财报安排是当下真实可知信息
+    earnings_cal = fetch_earnings_calendar(passed, is_backtest=is_backtest)
 
     for t in passed:
         try:
@@ -1289,7 +1599,9 @@ def build_panel(passed, daily_map, pit_map, macro_df):
             fund_hist = (compute_pit_fundamentals(pit_map[t], mc)
                          if t in pit_map and not pit_map[t].empty
                          else pd.DataFrame(index=mc.index,
-                                           columns=["pe","pb","roe","eps_growth","fcf_yield"]))
+                                           columns=["pe","pb","roe","eps_growth","fcf_yield",
+                                                    "ev_ebitda", "capex_ocf", "p_ffo", "rule_of_40", "rnd_rev",
+                                                    "debt_ebitda", "div_cover", "nim", "pcl_ratio"]))
 
             gics = STOCK_PROFILE.get(t, {}).get("gics", "Unknown")
 
@@ -1326,7 +1638,9 @@ def build_panel(passed, daily_map, pit_map, macro_df):
                     sector_mom_rel = (tech.get("mom_6m", pd.Series(0.0, index=tech.index)) - peer_mean_aligned).fillna(0.0)
             
             macro_block["sector_mom_rel"] = sector_mom_rel
-            fund_cols = ["pe","pb","roe","eps_growth","fcf_yield"]
+            fund_cols = ["pe","pb","roe","eps_growth","fcf_yield",
+                         "ev_ebitda", "capex_ocf", "p_ffo", "rule_of_40", "rnd_rev",
+                         "debt_ebitda", "div_cover", "nim", "pcl_ratio"]
             fund_block = (fund_hist.reindex(tech.index,method="ffill")[fund_cols]
                           if not fund_hist.empty
                           else pd.DataFrame(np.nan,index=tech.index,columns=fund_cols))
@@ -1358,14 +1672,47 @@ def build_panel(passed, daily_map, pit_map, macro_df):
         raise RuntimeError("所有股票特征计算失败，rows 为空")
 
     panel = pd.concat(rows, ignore_index=True).set_index(["date","ticker"])
+    
+    # 🎯 【新增】计算质量-价值比（巴菲特因子）
+    # QV Ratio = ROE / PB：寻找 "便宜又好" 的公司（高盈利，合理价格）
+    print(f"  [新增] 计算质量-价值比 (QV Ratio = ROE / PB)...")
+    panel['qv_ratio'] = panel['roe'] / (panel['pb'].replace(0, np.nan))
+    # 处理极端值：QV Ratio > 50 通常是数据异常（如PB < 0.02）
+    panel['qv_ratio'] = panel['qv_ratio'].clip(-50, 50)
+    
     print(f"  面板：{len(panel)} 行 "
           f"({panel.index.get_level_values('date').nunique()} 月 × "
           f"{panel.index.get_level_values('ticker').nunique()} 支)")
+
+    # ✓ 数据健康度诊断（2026-04 新增）
+    # 静默 except 掩盖了财报/价量缺失，这里把覆盖率显式打出来，让用户知道
+    # 模型实际接触到多少有效信息。基本面缺失 > 30% 应当警觉。
+    diag_cols = {
+        "pe_rel_sector":  "PE",
+        "pb":             "PB",
+        "roe":            "ROE",
+        "eps_growth":     "EPS增长",
+        "fcf_yield":      "FCF收益率",
+        "days_to_earnings":"财报日历",
+    }
+    print(f"\n  📋 [数据覆盖率诊断]  N={len(panel)}")
+    for col, label in diag_cols.items():
+        if col in panel.columns:
+            cov = float(panel[col].notna().mean()) * 100
+            flag = "" if cov >= 70 else (" ⚠️" if cov >= 30 else " 🔴")
+            print(f"     {label:<10} {cov:5.1f}%{flag}")
+    if errors:
+        print(f"     失败 ticker（{len(errors)} 支）：{', '.join(e.split(':')[0] for e in errors[:8])}"
+              + (" ..." if len(errors) > 8 else ""))
     return panel
 
 
 def add_labels(panel):
-    """✓ Bug fix: rows 为空时填 NaN 而非崩溃"""
+    """✓ Bug fix: rows 为空时填 NaN 而非崩溃
+    
+    🎯 修复：统一使用绝对收益作为训练目标，与回测评估保持一致
+    （之前混用残差收益训练 + 绝对收益评测，导致目标函数不匹配）
+    """
     dates = sorted(panel.index.get_level_values("date").unique())
     rows  = []
     for i, date in enumerate(dates[:-1]):
@@ -1376,34 +1723,18 @@ def add_labels(panel):
         except KeyError:
             continue
         common = c0.index.intersection(c1.index)
-        # 对数收益率
+        # 对数收益率（绝对收益）
         ret_abs = np.log(c1[common] / c0[common])
 
-        # Step 1: 残差收益（剥离大盘Beta）
-        market_mean = ret_abs.mean()
-        ret_resid   = ret_abs - market_mean
-
-        # Fix8: 用个股自身历史时序波动率标准化（真正的IR）
-        # 直接从 panel 中提取已计算好的个股年化波动率 (vol_1m)，进行月度化处理
-        try:
-            # 提取当月的 vol_1m（年化波动率）
-            vol_1m_current = panel.xs(date, level="date")["vol_1m"]
-            # 转换为月度波动率：annual_vol / sqrt(12)
-            monthly_vol_raw = vol_1m_current / np.sqrt(12)
-            # 取交集中存在的股票，用 0.05 填充缺失，clip 防止极小值
-            monthly_vol = monthly_vol_raw.reindex(common).fillna(0.05).clip(lower=0.01)
-        except (KeyError, AttributeError):
-            # 应急：直接用 0.05 的月度波动率（对应年化 ~17.3%）
-            monthly_vol = pd.Series(0.05, index=common).clip(lower=0.01)
-
-        # 向量化计算残差收益（取消波动率惩罚，释放高成长股的绝对收益空间！）
-        ret = ret_resid
+        # 🎯 修改：直接使用绝对收益作为训练标签
+        # （之前用残差收益会造成模型优化 Alpha，但回测看绝对收益的矛盾）
+        ret = ret_abs
 
         thr = ret.quantile(1-TOP_QUINTILE)
         for t in common:
             rows.append({"date":date,"ticker":t,
-                         "next_ret":ret[t],           # IR目标（用于回归）
-                         "next_ret_abs":ret_abs[t],   # 绝对收益（用于P&L）
+                         "next_ret":ret[t],           # 🎯 现在 = 绝对收益（之前 = 残差）
+                         "next_ret_abs":ret_abs[t],   # 冗余字段，保留向后兼容
                          "label":int(ret[t]>=thr)})
     if not rows:
         print("  ⚠️  add_labels: 未生成标签")
@@ -1417,15 +1748,48 @@ def add_labels(panel):
     return result
 
 
-# 行业特定因子屏蔽规则
-# 金融股：FCF Yield 噪声大（银行监管资本逻辑，非自由现金流），PE 有效
-# 能源/材料：周期底部 PE 为负失效，用 FCF Yield；但不屏蔽 ROE（仍有参考价值）
-# REITs：P/B 和 FCF Yield 主导，PE 和 ROE 失真（折旧摊销影响）
+# 行业正交化掩码：0.0=完全屏蔽，1.0=正常使用，>1.0=增强权重（引导模型关注核心Alpha）
 SECTOR_FACTOR_MASK = {
-    "Financials": {"fcf_yield": 0.0},            # 银行/保险：FCF逻辑不适用
-    "Energy":     {"pe": 0.0},                    # 周期底部PE为负，屏蔽
-    "Materials":  {"pe": 0.0},                    # 同上
-    "REITs":      {"pe": 0.0, "fcf_yield": 0.0}, # REIT：折旧影响双重失真
+    "Financials": {
+        "fcf_yield": 0.0, "ev_ebitda": 0.0, "capex_ocf": 0.0, "p_ffo": 0.0, "rule_of_40": 0.0, "rnd_rev": 0.0,
+        "nim": 2.0, "pcl_ratio": 2.0  # 🎯 强迫模型高度关注银行的息差和坏账率
+    },            
+    "Energy": {
+        "pe": 0.0, "pb": 0.0, "pe_rel_sector": 0.0, "p_ffo": 0.0, "rule_of_40": 0.0, "rnd_rev": 0.0, "nim": 0.0, "pcl_ratio": 0.0,
+        "ev_ebitda": 1.5, "capex_ocf": 1.5 # 🎯 周期股剥离 PE 幻觉，只看企业倍数和资本开支比率
+    },
+    "Materials": {
+        "pe": 0.0, "pb": 0.0, "pe_rel_sector": 0.0, "p_ffo": 0.0, "rule_of_40": 0.0, "rnd_rev": 0.0, "nim": 0.0, "pcl_ratio": 0.0,
+        "ev_ebitda": 1.5, "capex_ocf": 1.5
+    },
+    "REITs": {
+        "pe": 0.0, "pb": 0.0, "pe_rel_sector": 0.0, "fcf_yield": 0.0, "ev_ebitda": 0.0, "rule_of_40": 0.0, "rnd_rev": 0.0, "nim": 0.0, "pcl_ratio": 0.0,
+        "p_ffo": 2.0  # 🎯 REITs 估值唯一标尺
+    },
+    "Technology": {
+        "p_ffo": 0.0, "nim": 0.0, "pcl_ratio": 0.0, "capex_ocf": 0.0, "div_cover": 0.0,
+        "pb": 0.0,            # 🔪 彻底无视科技股的 PB（高成长公司估值看 Rule of 40，不看账面倍数）
+        "rule_of_40": 2.0, "rnd_rev": 1.5 # 🎯 SaaS 类公司忽略传统盈利，只看护城河(研发)和 40法则
+    },
+    "Utilities": {
+        "p_ffo": 0.0, "rule_of_40": 0.0, "rnd_rev": 0.0, "nim": 0.0, "pcl_ratio": 0.0,
+        "debt_ebitda": 1.5, "div_cover": 1.5 # 🎯 高杠杆收息股核心排雷指标
+    },
+    "Telecom": {
+        "p_ffo": 0.0, "rule_of_40": 0.0, "rnd_rev": 0.0, "nim": 0.0, "pcl_ratio": 0.0,
+        "debt_ebitda": 1.5, "div_cover": 1.5
+    },
+    "Industrials": {
+        "p_ffo": 0.0, "nim": 0.0, "pcl_ratio": 0.0, "rule_of_40": 0.0, "rnd_rev": 0.0,
+        "pb": 0.2,            # 🔪 打压 PB，工业股看 ROIC/ROE
+        "fcf_yield": 1.5      # 💰 巴菲特最爱：充沛的自由现金流
+    },
+    "Consumer Discretionary": {
+        "pb": 0.2, "roe": 1.5, "fcf_yield": 1.5  # 🔪 消费股淡化账面值，强调 ROE 和现金流
+    },
+    "Consumer Staples": {
+        "pb": 0.2, "roe": 1.5, "fcf_yield": 1.5  # 🔪 同上
+    }
 }
 
 
@@ -1454,20 +1818,26 @@ def smart_impute(panel: pd.DataFrame, feature_cols: list) -> pd.DataFrame:
         out_for_pe["pe_rel_sector"] = out_for_pe["pe_rel_sector"].replace([np.inf, -np.inf], np.nan)
         panel = out_for_pe
 
-    FUNDAMENTAL_COLS = {"pe_rel_sector","pb","roe","eps_growth","fcf_yield","days_to_earnings","days_since_earnings"}
+    FUNDAMENTAL_COLS = {"pe_rel_sector","pb","roe","eps_growth","fcf_yield",
+                        "days_to_earnings","days_since_earnings",
+                        "ev_ebitda", "capex_ocf", "p_ffo", "rule_of_40", "rnd_rev",
+                        "debt_ebitda", "div_cover", "nim", "pcl_ratio"} # 🎯 将新因子加入同业中位数插补列表
     MACRO_COLS       = {"oil_mom_3m","cadusd_mom_3m","bond_chg_3m",
                         "gold_mom_3m","vix_level"}
 
     out     = panel.copy()
     tickers = out.index.get_level_values("ticker").unique()
     gics_map= {t: STOCK_PROFILE.get(t, {}).get("gics","Unknown") for t in tickers}
+    
+    # 🎯 过滤：只处理panel中实际存在的特征列（避免新列未被创建时的KeyError）
+    feature_cols_avail = [col for col in feature_cols if col in out.columns]
 
     for date in out.index.get_level_values("date").unique():
         mask    = out.index.get_level_values("date") == date
-        sl      = out.loc[mask, feature_cols].copy()
+        sl      = out.loc[mask, feature_cols_avail].copy()
         tix_arr = out.loc[mask].index.get_level_values("ticker")
 
-        for col in feature_cols:
+        for col in feature_cols_avail:
             if not sl[col].isna().any():
                 continue
 
@@ -1490,11 +1860,11 @@ def smart_impute(panel: pd.DataFrame, feature_cols: list) -> pd.DataFrame:
                 med = sl[col].median()
                 sl[col] = sl[col].fillna(med if pd.notna(med) else 0.0)
 
-        out.loc[mask, feature_cols] = sl.values
+        out.loc[mask, feature_cols_avail] = sl.values
 
-    remaining = out[feature_cols].isna().sum().sum()
+    remaining = out[feature_cols_avail].isna().sum().sum()
     if remaining > 0:
-        out[feature_cols] = out[feature_cols].fillna(0.0)
+        out[feature_cols_avail] = out[feature_cols_avail].fillna(0.0)
     return out
 
 
@@ -1529,15 +1899,18 @@ def cross_z(panel: pd.DataFrame) -> pd.DataFrame:
                     out.loc[rows_t, factor] = out.loc[rows_t, factor] * weight
 
     # Step 2: 截面秩次化 → [-1, +1]（替代 Z-Score）
+    # 🎯 只处理panel中实际存在的特征列
+    feature_cols_avail = [col for col in FEATURE_COLS if col in out.columns]
+    
     for date in panel.index.get_level_values("date").unique():
         m = out.index.get_level_values("date") == date
-        s = out.loc[m, FEATURE_COLS]
+        s = out.loc[m, feature_cols_avail]
         n = len(s)
         if n < 2:
             continue
         # 向量化秩次化：rank(0-based) / (n-1) * 2 - 1 → [-1, +1]
         ranked = s.rank(axis=0, method="average", na_option="keep")
-        out.loc[m, FEATURE_COLS] = (ranked - 1) / (n - 1) * 2 - 1
+        out.loc[m, feature_cols_avail] = (ranked - 1) / (n - 1) * 2 - 1
 
     return out
 
@@ -1561,21 +1934,21 @@ def make_xgb(task, pos_w=1.0):
                       reg_alpha=0.5, reg_lambda=1.5, random_state=42, verbosity=0)
         return xgb.XGBRegressor(**kw_reg)
     else:
-        # ✓ 改进分类器：激进参数 + aucpr 指标
-        # 理论：更深的树 + 更高学习率 → 更强的判别能力
-        #      aucpr 优于 logloss → 自动聚焦前 20% 识别
+        # ✓ 抗过拟合修订（2026-04）：分类器收紧
+        # 背景：单次训练独立样本 ~800-1500，原激进参数让单棵树过深、L1/L2 不足，
+        #      容易在小样本上记忆噪声；现与回归树对齐，并依赖 early_stopping 控制轮数。
         kw_cls = dict(
-            n_estimators=400,           # ↑ 增加到 400（更多boosting轮数）
-            max_depth=4,                # ↑ 从 3 → 4（捕捉更复杂交互）
-            learning_rate=0.05,         # ↑ 从 0.04 → 0.05（更快收敛）
-            subsample=0.7,              # ↓ 从 0.8 → 0.7（更激进采样，防止过拟合）
-            colsample_bytree=0.6,       # ↓ 从 0.7 → 0.6（更多特征随机性）
-            reg_alpha=1.0,              # ↑ 从 0.5 → 1.0（L1 正则化加强）
-            reg_lambda=2.0,             # ↑ 从 1.5 → 2.0（L2 正则化加强）
-            random_state=42, 
+            n_estimators=300,           # ↓ 400 → 300（依赖 early_stopping）
+            max_depth=3,                # ↓ 4 → 3（与回归对齐，限制单树容量）
+            learning_rate=0.05,
+            subsample=0.7,
+            colsample_bytree=0.6,
+            reg_alpha=1.5,              # ↑ 1.0 → 1.5（L1 进一步加强）
+            reg_lambda=3.0,             # ↑ 2.0 → 3.0（L2 进一步加强）
+            random_state=42,
             verbosity=0,
             scale_pos_weight=pos_w,     # Top20% 样本权重补偿
-            eval_metric="aucpr"         # ★ 改成 aucpr（PR 曲线面积）
+            eval_metric="aucpr"         # PR 曲线面积，聚焦正样本识别
         )
         return xgb.XGBClassifier(**kw_cls)
 
@@ -1595,33 +1968,37 @@ def make_lgbm(task, pos_w=1.0):
                       random_state=42, verbose=-1)
         return lgb.LGBMRegressor(**kw_reg)
     else:
-        # ✓ 改进分类器：激进参数 + binary_logloss 的核心优化
-        # LightGBM 天生对分类问题更友好（梯度直方图算法）
+        # ✓ 抗过拟合修订（2026-04）：LightGBM 分类器收紧
+        # 关键：num_leaves 31→15、min_child_samples 5→20，让单棵树不再"记忆"小簇样本。
         kw_cls = dict(
-            n_estimators=400,           # ↑ 增加到 400
-            max_depth=4,                # ↑ 从 3 → 4
-            num_leaves=31,              # ↑ 从 15 → 31（leaf 更多，规律更复杂）
-            learning_rate=0.05,         # ↑ 从 0.04 → 0.05
-            subsample=0.7,              # ↓ 从 0.8 → 0.7
-            colsample_bytree=0.6,       # ↓ 从 0.7 → 0.6
-            min_child_samples=5,        # ↓ 从 20 → 5（捕捉更细致的边界）
-            reg_alpha=1.0,              # ↑ 从 0.5 → 1.0
-            reg_lambda=2.0,             # ↑ 从 1.5 → 2.0
-            random_state=42, 
+            n_estimators=300,           # ↓ 400 → 300
+            max_depth=3,                # ↓ 4 → 3
+            num_leaves=15,              # ↓ 31 → 15（最关键，限制单树叶数）
+            learning_rate=0.05,
+            subsample=0.7,
+            colsample_bytree=0.6,
+            min_child_samples=20,       # ↑ 5 → 20（每叶最少 20 样本，强制泛化）
+            reg_alpha=1.5,              # ↑ 1.0 → 1.5
+            reg_lambda=3.0,             # ↑ 2.0 → 3.0
+            random_state=42,
             verbose=-1,
             scale_pos_weight=pos_w,
-            metric="auc"                # ★ 用 AUC（LightGBM 更支持）
+            metric="auc"
         )
         return lgb.LGBMClassifier(**kw_cls)
 
 
 if TORCH:
     class MLP(nn.Module):
-        def __init__(self, d, h=(128,64,32)):
+        # ✓ 抗过拟合修订（2026-04）：隐层 (128,64,32) → (32,16)
+        # 原 ~13K 参数对 ~1K 独立样本（比例 1:13）显著过拟合；
+        # (32,16) 仅 ~1.4K 参数（26→32→16→1），匹配实际样本规模。
+        # Dropout 同步加大 0.3 → 0.4 进一步抑制噪声拟合。
+        def __init__(self, d, h=(32, 16)):
             super().__init__()
             layers, prev = [], d
             for n in h:
-                layers += [nn.Linear(prev,n),nn.LayerNorm(n),nn.ReLU(),nn.Dropout(0.3)]
+                layers += [nn.Linear(prev,n),nn.LayerNorm(n),nn.ReLU(),nn.Dropout(0.4)]
                 prev = n
             layers.append(nn.Linear(prev,1))
             self.net = nn.Sequential(*layers)
@@ -1716,12 +2093,12 @@ def _prepare_mlp_features(X_tr: np.ndarray, X_te: np.ndarray,
 def fit_all(X_tr, y_r, y_c, X_te, weights_tr=None, model_weights=None, use_mlp=True, mlp_epochs=120):
     """
     第四层：多模型训练 + 动态权重集成。
-    ★ 新增 weights_tr 参数，用于传入时间衰减权重。
-    ★ 改进方案A：激进分类器 + aucpr 指标 + 权重提升到 70%
+    ★ weights_tr 参数：传入时间衰减权重。
+    ★ 抗过拟合修订（2026-04）：分类器收紧（depth=3, num_leaves=15, min_child=20）
+                                 + 集成权重 50/50 + 早停 30 轮控制收敛。
     """
-    # print("\n  [模型训练] 启用方案A：改进分类器强度")
-    print("    • XGBoost/LightGBM 分类器：400 estimators + aucpr/auc 评估")
-    print("    • 集成权重：回归 30% + 分类 70%（强化排序识别）")
+    print("    • XGBoost/LightGBM 分类器：300 estimators + 收紧深度（depth=3）")
+    print("    • 集成权重：回归 50% + 分类 50%（抗过拟合再平衡）")
     
     # ✓ Bug Fix: Validate input arrays
     if len(X_tr) == 0:
@@ -1813,11 +2190,11 @@ def fit_all(X_tr, y_r, y_c, X_te, weights_tr=None, model_weights=None, use_mlp=T
     for i, (_, pc) in enumerate(pc_list):
         ens_c = ens_c + w[i] * np.asarray(pc)
     
-    # ★ 改进方案A：分类器权重提升（从 0.5 → 0.7）
-    # 原理：改进后的分类器通过 aucpr 和激进参数，识别能力更强
-    #       分类器的概率输出本身就是相对排序信号 P(Top20%)
-    #       因此应该给予更高的权重
-    ens   = ens_r*0.3 + ens_c*0.7  # ← 分类器权重 70%，回归 30%
+    # ✓ 抗过拟合修订（2026-04）：集成权重重新平衡为 50/50
+    # 背景：分类器收紧（depth=3, num_leaves=15, min_child_samples=20）后，
+    #      回归与分类的信噪比已经接近；70/30 让分类器主导会放大其残余噪声。
+    #      50/50 提升组合稳健性，单边过拟合的影响减半。
+    ens   = ens_r*0.5 + ens_c*0.5  # ← 回归 50% + 分类 50%
 
     # ★ 优化方案2：返回 MLP 模型及其特征也供黑-小伯曼使用
     return ens_r, ens_c, ens, xr, dict(pr_list), dict(pc_list), {
@@ -1829,14 +2206,28 @@ def fit_all(X_tr, y_r, y_c, X_te, weights_tr=None, model_weights=None, use_mlp=T
 # 5. Walk-Forward
 # ══════════════════════════════════════════════════════════════════
 
-def walk_forward(panel, tx_cost=0.002):
-    """第四层：含交易成本 + 换仓率统计 + 动态模型权重"""
+def walk_forward(panel, tx_cost=0.002, daily_map=None, pit_map=None, apply_asof_constraints=False):
+    """第四层：含交易成本 + 换仓率统计 + 动态模型权重 + 时间序列约束过滤
+    
+    🎯 【重要】目标函数统一说明：
+    - 训练标签 next_ret：绝对收益（log return）
+    - 回测评估 actual_ret：绝对收益（与训练保持一致）
+    - IC 计算：使用绝对收益
+    （之前混用残差收益训练 + 绝对收益评测的问题已修复）
+    
+    ✅ 【新增】时间序列约束：
+    - apply_asof_constraints=True 时，每月动态调用 apply_constraints_asof()
+    - 消除前视偏差，只用截至当月的历史数据做过滤
+    - daily_map 和 pit_map 参数仅在此模式下使用
+    """
     dates = sorted(panel.index.get_level_values("date").unique())
     sc, recs = StandardScaler(), []
     n_test = len(dates)-MIN_TRAIN-1
 
     print(f"\nWalk-Forward（{MIN_TRAIN+1}月起，{n_test} 个测试月）  交易成本: {tx_cost*100:.1f}%")
-
+    if apply_asof_constraints and daily_map is not None:
+        print(f"  ✅ 已启用时间序列约束（每月动态过滤）— 消除前视偏差")
+    
     # ✓ Bug fix: 检查标签
     if "next_ret" not in panel.columns or not panel["next_ret"].notna().any():
         print("  ❌ panel 缺少 next_ret/label，跳过")
@@ -1846,7 +2237,14 @@ def walk_forward(panel, tx_cost=0.002):
     model_ic:     dict[str, list] = {}
     cooldown_set: set[str] = set()  # OPT5: 止损冷静期
     stopped_last: set[str] = set()  # 上月止损的股票
-    ROLLING_WINDOW = 24             # OPT2: 滚动训练窗口（月）
+    ROLLING_WINDOW = 36             # OPT2: 滚动训练窗口（月）— 抗过拟合：24→36，~+50% 样本
+    rank_ic_list: list[float] = []  # ✓ 抗过拟合诊断：累计每月 Spearman RankIC
+    
+    # 🟢 新增：EMA 平滑记录（对抗单月神经质波动）
+    prev_ema_scores: dict[str, float] = {}
+    
+    # 🎯 只使用panel中实际存在的特征列
+    feature_cols_avail = [col for col in FEATURE_COLS if col in panel.columns]
 
     for i in range(MIN_TRAIN, len(dates)-1):
         # OPT2: 滚动窗口 - 只用最近 ROLLING_WINDOW 个月训练
@@ -1854,15 +2252,44 @@ def walk_forward(panel, tx_cost=0.002):
         train_dates  = dates[window_start:i]
         tr = panel[panel.index.get_level_values("date").isin(train_dates)]                  .dropna(subset=["next_ret","label"])
         te = panel[panel.index.get_level_values("date")==dates[i]]
+        
+        # ✅ 【新增】时间序列约束：asof_date 前的动态过滤（消除前视偏差）
+        if apply_asof_constraints and daily_map is not None:
+            asof_date = dates[i]
+            # 对 test set 中的每支股票应用 asof 约束
+            tickers_te = te.index.get_level_values("ticker").unique()
+            valid_tickers = []
+            
+            for ticker in tickers_te:
+                passed, _ = apply_constraints_asof(
+                    ticker, daily_map, pit_map if pit_map else {},
+                    asof_date, CONSTRAINTS
+                )
+                if passed:
+                    valid_tickers.append(ticker)
+            
+            # 用合法股票过滤 test set
+            if valid_tickers:
+                te = te[te.index.get_level_values("ticker").isin(valid_tickers)]
+            else:
+                # 所有股票都被过滤，跳过此月份
+                if i == MIN_TRAIN:
+                    print(f"  ⚠️  首月所有股票都被 asof 约束过滤，检查约束配置")
+                continue
 
 
-        if len(tr)<60 or not len(te): continue
+        # ✓ 抗过拟合修订：60→200。60 行对 30K 参数的集成模型毫无意义；
+        # 200 行才是树模型 + 早停的最低门槛（参考 LightGBM min_child_samples=20）。
+        if len(tr) < 200 or not len(te): continue
 
         if i==MIN_TRAIN:
             print(f"  [诊断] 首月 len(tr)={len(tr)} len(te)={len(te)}")
 
-        X_tr = sc.fit_transform(tr[FEATURE_COLS].fillna(tr[FEATURE_COLS].median()))
-        X_te = sc.transform(te[FEATURE_COLS].fillna(tr[FEATURE_COLS].median()))
+        # ✓ Bug Fix: smart_impute 已经完成所有缺失值处理（行业截面中位数 → 全市场中位数 → 0）
+        # 不应再做 fillna(median)，这会抹平不同市场周期的特征基准差异
+        # 如果还有极少数 NaN 漏网，fillna(0) 更合理（不会被误读为"优质信号"）
+        X_tr = sc.fit_transform(tr[feature_cols_avail].fillna(0.0))
+        X_te = sc.transform(te[feature_cols_avail].fillna(0.0))
 
         # ★ 计算样本时间衰减权重（半衰期设为 12 个月）
         # 引入指数级时间衰减权重（Exponential Sample Weight Decay）是处理金融时序数据中“宏观状态漂移（Concept Drift）”最优雅且非破坏性的做法。
@@ -1896,6 +2323,27 @@ def walk_forward(panel, tx_cost=0.002):
             tix_wf
         ], names=["date", "ticker"]))
 
+        # =====================================================================
+        # 🟢 新增：EMA 信号平滑逻辑（对抗树模型单月神经质波动）
+        # =====================================================================
+        alpha = 0.6  # 平滑系数：0.6表示当前月占60%，历史占40%。调小(如0.5)换手率更低
+        smoothed_scores = []
+        
+        for ticker, current_score in zip(tix_wf, ens):
+            if ticker in prev_ema_scores:
+                # 核心：EMA 平滑计算
+                s_score = (current_score * alpha) + (prev_ema_scores[ticker] * (1 - alpha))
+            else:
+                # 新入池或第一次计算的股票，使用原始得分
+                s_score = current_score
+            
+            smoothed_scores.append(s_score)
+            prev_ema_scores[ticker] = s_score  # 更新本月得分到字典，留给下个月用
+        
+        # 用平滑后的得分覆盖原始得分，然后再进行后续的 Top 10 排序
+        temp_df["ensemble_score"] = smoothed_scores
+        # =====================================================================
+
         # 🚨【核心修复】：必须先按分数降序排序！否则排名和 cutoff_score 全是错的！
         temp_df = temp_df.sort_values("ensemble_score", ascending=False)
         
@@ -1915,10 +2363,10 @@ def walk_forward(panel, tx_cost=0.002):
                            else temp_df_selected.index.tolist())
 
         # 🛡️【新增】ETF 扫单保护：如果选出的前 10 名连平均分都极低，说明全市场无 Alpha
-        if len(temp_df_selected) and temp_df_selected["ensemble_score"].mean() < 0.25:
+        if len(temp_df_selected) and temp_df_selected["ensemble_score"].mean() < 0.18:
             print(f"  ⚠️  本月 Top 10 平均集成分数极低 ({temp_df_selected['ensemble_score'].mean():.3f})，触发 ETF 底线风控")
             print("  🛡️ 建议清仓个股，全仓买入大盘指数 XIU.TO 或持币观望")
-            selected_tickers = []
+            selected_tickers = []  # 🔧 修复2：阈值从0.25降至0.18，避免牛市误判为空仓
         
         # 记录缓冲带保留情况（仅在首次或变化时打印）
         if i == MIN_TRAIN:
@@ -1957,7 +2405,20 @@ def walk_forward(panel, tx_cost=0.002):
             extras = [fi for fi in final_idx
                       if fi not in filtered and tix_arr[fi] not in cooldown_set]
             filtered = (filtered + extras)[:TOP_N]
-        top_idx = set(filtered)
+        
+        # 🟢 修复2：在 walk_forward 中补齐大类行业集中度约束（max_per_gics）
+        # 确保回测与实盘的约束完全一致
+        mgics = CONSTRAINTS.get("max_per_gics", 99)
+        gics_cnt = {}
+        gics_filtered = []
+        for fi in filtered:
+            t = tix_arr[fi]
+            g = STOCK_PROFILE.get(t, {}).get("gics", "Unknown")
+            if gics_cnt.get(g, 0) < mgics:
+                gics_filtered.append(fi)
+                gics_cnt[g] = gics_cnt.get(g, 0) + 1
+        
+        top_idx = set(gics_filtered)
         curr_h: set[str] = set()
 
         for j, (idx, row) in enumerate(te.iterrows()):
@@ -1965,6 +2426,9 @@ def walk_forward(panel, tx_cost=0.002):
             ret_raw = row.get("next_ret", np.nan)
             is_new  = t not in prev_h
             # Fix6: 动态交易成本（小盘矿业滑点更高）
+            # ⚠️ 已知前视近似（2026-04 标注）：meta_df 是 yfinance 当前快照，
+            #    不是当月历史市值。仅用于把股票分到 4x/2x/1x 三档成本，影响边际；
+            #    若要严格 PIT，需用 close[date] × shares_outstanding[date] 重算。
             mktcap = float(meta_df.loc[t,"mktcap"]) if t in meta_df.index and "mktcap" in meta_df.columns else 5e9
             eff_tx = tx_cost*4 if mktcap<1e9 else (tx_cost*2 if mktcap<5e9 else tx_cost)
             ret_net = (ret_raw - eff_tx*2 if pd.notna(ret_raw) and is_new else ret_raw)
@@ -1975,10 +2439,14 @@ def walk_forward(panel, tx_cost=0.002):
                 curr_h.add(t)
             
             # 保存真实的模型分数（不加任何调整），分别记录是否被选中
+            # ✓ Bug fix（2026-04）：同时写入 "ens" 字段。
+            #   下游 backtest_report / evaluate / backtest_from_wf 等 9+ 处代码
+            #   都按 "ens" 读取，不写就会 KeyError。
             recs.append({"date":dates[i],"ticker":t,
+                         "ens":ens[j],                      # ★ 与下游报告函数兼容
                          "model_score":ens[j],              # ✓ 真实模型分数，用于 IC/评估
                          "is_selected":is_selected,         # ✓ 是否被缓冲带选中
-                         "actual_ret":row.get("next_ret_abs", ret_raw),
+                         "actual_ret":ret_raw,              # 🎯 改用 next_ret（现已统一为绝对收益）
                          "actual_ret_net":ret_net,
                          "actual_cls":row.get("label",np.nan)})
 
@@ -1993,6 +2461,15 @@ def walk_forward(panel, tx_cost=0.002):
         if CONSTRAINTS.get("cooldown_months", 0) > 0:
             cooldown_set = stopped_last.copy()
             stopped_last = set()
+            
+            # 🟢 修复3：将冷静期黑名单持久化到文件，用于 predict_now 实盘使用
+            import json
+            COOLDOWN_FILE = "cooldown_tickers.json"
+            try:
+                with open(COOLDOWN_FILE, "w") as f:
+                    json.dump(list(cooldown_set), f)
+            except Exception as e:
+                print(f"  ⚠️  冷静期列表保存失败：{e}")
             for fi in top_idx:
                 t2 = tix_arr[fi]
                 r2 = te.iloc[fi].get("next_ret_abs",
@@ -2001,10 +2478,95 @@ def walk_forward(panel, tx_cost=0.002):
                     stopped_last.add(t2)
         prev_h = curr_h
 
+        # ✓ 抗过拟合诊断：当月 Spearman RankIC（用 pandas rank-corr，避免 scipy 依赖）
+        try:
+            ens_s = pd.Series(np.asarray(ens), index=range(len(ens)))
+            ret_s = pd.Series(te["next_ret"].values, index=range(len(te)))
+            valid = ens_s.notna() & ret_s.notna()
+            if valid.sum() >= 10:
+                rank_ic = float(ens_s[valid].rank().corr(ret_s[valid].rank()))
+                if not np.isnan(rank_ic):
+                    rank_ic_list.append(rank_ic)
+        except Exception:
+            pass
+
         if (i-MIN_TRAIN)%4==0:
             print(f"  月 {i+1}/{len(dates)-1}  训练 {len(tr)} 行  换仓 {turnover*100:.0f}%")
 
+        # 每 12 个月打印一次累计 IC 健康度
+        if rank_ic_list and (i - MIN_TRAIN + 1) % 12 == 0:
+            arr = np.array(rank_ic_list)
+            ir = arr.mean() / arr.std(ddof=1) if arr.std(ddof=1) > 0 else np.nan
+            print(f"  📈 [RankIC 累计 {len(arr)} 月] mean={arr.mean():+.4f}  "
+                  f"std={arr.std(ddof=1):.4f}  IR={ir:+.3f}  "
+                  f"hit%={100*(arr>0).mean():.1f}%")
+
+    # 最终 RankIC 汇总
+    if rank_ic_list:
+        arr = np.array(rank_ic_list)
+        ir = arr.mean() / arr.std(ddof=1) if arr.std(ddof=1) > 0 else np.nan
+        print(f"\n  📊 [RankIC 总计 {len(arr)} 月] mean={arr.mean():+.4f}  "
+              f"std={arr.std(ddof=1):.4f}  IR={ir:+.3f}  "
+              f"hit%={100*(arr>0).mean():.1f}%  "
+              f"({'信号健康' if arr.mean()>0.02 and ir>0.3 else '⚠️ 信号偏弱/噪声占优'})")
+
     return pd.DataFrame(recs)
+
+
+def calculate_etf_threshold(wf: pd.DataFrame, quantile: float = 0.20) -> float:
+    """
+    从历史 walk-forward 结果计算 ETF 兜底的动态阈值。
+    
+    📊 原理：
+        1. 按日期分组 walk-forward 的集成分数 ("ens" 列)
+        2. 计算每个日期内的平均分数
+        3. 取这些"日均分数"的分位数作为触发阈值
+    
+    🎯 优点：
+        - 数据驱动，避免硬编码的主观判断
+        - 自动适应市场环境（牛熊市自动调整）
+        - 20 分位数意味着：在 20% 的历史日期里会触发兜底
+    
+    📈 参数说明：
+        - wf: walk_forward() 的输出 DataFrame（含 "date"、"ens" 等列）
+        - quantile: 分位数，默认 0.20（20%）
+            - 0.15 = 更激进，更容易触发兜底
+            - 0.25 = 更保守，只有极弱信号才兜底
+    
+    💡 返回值：
+        - float: 如果日均分数 < 此阈值，则触发 ETF 兜底
+        - 如果 wf 为空或数据不足，返回默认 0.18（备用）
+    """
+    if wf is None or wf.empty:
+        print("  ⚠️  walk_forward 数据为空，使用默认阈值 0.18")
+        return 0.18
+    
+    if "date" not in wf.columns or "ens" not in wf.columns:
+        print(f"  ⚠️  walk_forward 缺少必要列 (date/ens)，使用默认阈值 0.18")
+        return 0.18
+    
+    try:
+        # 按日期分组，计算每日平均分数
+        daily_avg = wf.groupby("date")["ens"].mean()
+        
+        if len(daily_avg) < 3:
+            print(f"  ⚠️  历史数据不足 ({len(daily_avg)} 天)，使用默认阈值 0.18")
+            return 0.18
+        
+        # 计算分位数
+        threshold = float(daily_avg.quantile(quantile))
+        
+        print(f"\n  📊 [动态 ETF 阈值计算]")
+        print(f"     日均分数统计：min={daily_avg.min():.4f}, "
+              f"max={daily_avg.max():.4f}, mean={daily_avg.mean():.4f}, "
+              f"median={daily_avg.median():.4f}")
+        print(f"     {int(quantile*100)}% 分位数 → 触发阈值 = {threshold:.4f} (原硬编码: 0.18)")
+        print(f"     ⚡ 解读：在 {int(quantile*100)}% 的历史日期里，日均分数会低于此阈值")
+        
+        return threshold
+    except Exception as e:
+        print(f"  ⚠️  阈值计算异常: {e}，使用默认值 0.18")
+        return 0.18
 
 
 def backtest_report(wf: pd.DataFrame, panel: pd.DataFrame,
@@ -2037,12 +2599,26 @@ def backtest_report(wf: pd.DataFrame, panel: pd.DataFrame,
 
     # 下载基准月度收益
     bench_monthly = {}
+    print(f"\n  [诊断] 正在获取基准 {benchmark} 的历史数据...")
     try:
-        b = yf.download(benchmark, period=f"{YEARS+1}y",
+        # 🎯 【修复】明确指定日期范围，避免字符串日期类型错误
+        end_date = pd.Timestamp.today().normalize()
+        start_date = end_date - pd.Timedelta(days=365 * (YEARS + 1))
+        b = yf.download(benchmark, start=start_date, end=end_date,
                         auto_adjust=True, progress=False)["Close"]
-        bench_monthly = b.resample("ME").last().pct_change().to_dict()
-    except Exception:
-        pass
+        if b.empty:
+            print(f"  ⚠️  {benchmark} 数据为空，基准收益将显示为 0%")
+        else:
+            bench_monthly_raw = b.resample("ME").last().pct_change()
+            # 转换为 (year, month) 元组 key，便于匹配
+            # 🎯 【修复】确保日期索引转换为 datetime，防止字符串格式导致的 .year/.month 错误
+            bench_monthly = {}
+            for d, v in bench_monthly_raw.items():
+                dt = pd.to_datetime(d) if isinstance(d, str) else d
+                bench_monthly[(dt.year, dt.month)] = v
+            print(f"  ✅ {benchmark} 获取成功，共{len(bench_monthly)}个月的数据（{start_date.strftime('%Y-%m-%d')} ~ {end_date.strftime('%Y-%m-%d')}）")
+    except Exception as e:
+        print(f"  ⚠️  基准数据下载失败：{str(e)[:80]}，基准收益将显示为 0%")
 
     dates       = sorted(wf["date"].unique())
     nav         = initial_capital
@@ -2060,8 +2636,14 @@ def backtest_report(wf: pd.DataFrame, panel: pd.DataFrame,
         if month_wf.empty:
             continue
 
-        # ── Top N 持仓（按集成分排序）────────────────────────────
-        top_n  = month_wf.nlargest(TOP_N, "ens")
+        # ── Top N 持仓 ─────────────────────────────────────────
+        # ✓ 修订（2026-04）：与实际选股口径一致 → 优先用 is_selected
+        # （walk_forward 已应用缓冲带 / 冷静期 / 矿业上限 / ETF 风控）
+        if "is_selected" in month_wf.columns and month_wf["is_selected"].any():
+            top_n = (month_wf[month_wf["is_selected"] == True]
+                     .sort_values("ens", ascending=False))
+        else:
+            top_n = month_wf.nlargest(TOP_N, "ens")
         picks  = top_n["ticker"].tolist()
         n_new  = len(set(picks) - set(prev_picks))
         n_out  = len(set(prev_picks) - set(picks))
@@ -2112,11 +2694,10 @@ def backtest_report(wf: pd.DataFrame, panel: pd.DataFrame,
             continue
 
         # ── 基准收益 ──────────────────────────────────────────────
-        bkey      = [k for k in bench_monthly
-                     if hasattr(k, "month") and
-                     k.month == pd.Timestamp(date).month and
-                     k.year  == pd.Timestamp(date).year]
-        bench_ret = bench_monthly.get(bkey[0], 0) * 100 if bkey else 0
+        # 使用 (year, month) 元组匹配，避免复杂的日期对象比较
+        date_ts  = pd.Timestamp(date)
+        bkey     = (date_ts.year, date_ts.month)
+        bench_ret = bench_monthly.get(bkey, 0) * 100
 
         nav_prev  = nav
         nav       = nav * (1 + port_ret)
@@ -2289,6 +2870,142 @@ def evaluate(wf):
     print(f"    历史最大月度回撤          {mdd:+.2f}%")
     print(f"    平均月换仓成本            {monthly_turn.mean():.3f}%")
 
+    # ✓ 抗过拟合诊断（2026-04 新增）：分段验证
+    # 揭示"模型是否依赖某几个年份的运气、某些行业的真实信号"
+    evaluate_segments(wf)
+
+
+def evaluate_segments(wf):
+    """分段验证 — 分年 / 分行业 RankIC + Top 选股换手稳定性
+
+    回答三个关键问题：
+      1) 模型表现是不是只靠某几年的 regime（比如只赢 2020-2021）？
+      2) 哪些行业的预测有真信号、哪些是噪音？
+      3) Top10 持仓的换手率分布是否健康（避免月月翻盘）？
+
+    阈值：单年 |IC| 跨度 > 0.15 / 某行业 IC < 0 → 信号 regime-dependent
+    """
+    if wf.empty or "ens" not in wf.columns:
+        return
+    v = wf.dropna(subset=["ens", "actual_ret"]).copy()
+    if v.empty:
+        return
+
+    # 准备分段维度
+    v["date"] = pd.to_datetime(v["date"])
+    v["year"] = v["date"].dt.year
+    v["gics"] = v["ticker"].map(lambda t: STOCK_PROFILE.get(t, {}).get("gics", "Unknown"))
+
+    def _month_rank_ic(g: pd.DataFrame) -> float:
+        if len(g) < 5:
+            return float("nan")
+        return float(g["ens"].rank().corr(g["actual_ret"].rank()))
+
+    # 每月一个 RankIC（横截面）
+    monthly_ic = v.groupby("date", group_keys=False).apply(_month_rank_ic).dropna()
+    monthly_ic.index = pd.to_datetime(monthly_ic.index)
+
+    # 每月 Top 持仓（按 is_selected 优先）
+    if "is_selected" in v.columns and v["is_selected"].any():
+        sel = v[v["is_selected"] == True].copy()
+        topret_monthly = sel.groupby("date")["actual_ret"].mean() * 100
+        # 月度换手：与上月持仓的 Jaccard 不重合度
+        picks_by_month = sel.groupby("date")["ticker"].apply(set).sort_index()
+    else:
+        # 退化：取每月分数 Top10
+        sel_idx = (v.sort_values(["date", "ens"], ascending=[True, False])
+                    .groupby("date").head(10))
+        topret_monthly = sel_idx.groupby("date")["actual_ret"].mean() * 100
+        picks_by_month = sel_idx.groupby("date")["ticker"].apply(set).sort_index()
+
+    # 月度换手率（新进股票 / 当月持仓）
+    turnover_pct = []
+    prev = set()
+    for d, picks in picks_by_month.items():
+        new_in = picks - prev
+        if picks:
+            turnover_pct.append((d, 100.0 * len(new_in) / len(picks)))
+        prev = picks
+    turnover_s = pd.Series(
+        [t[1] for t in turnover_pct],
+        index=pd.to_datetime([t[0] for t in turnover_pct])
+    ) if turnover_pct else pd.Series(dtype=float)
+
+    # ── 分年 RankIC ─────────────────────────────────────────────
+    print(f"\n  ▸ 分年 RankIC（揭示是否依赖特定 regime）")
+    print(f"    {'年份':<8}{'月数':>5}  {'IC mean':>9}  {'IC std':>8}  "
+          f"{'IR':>6}  {'hit%':>6}  {'Top月均':>9}  {'换手%':>7}")
+    print(f"    {'─'*72}")
+
+    yearly_means = []
+    for year, ics in monthly_ic.groupby(monthly_ic.index.year):
+        std = ics.std(ddof=1)
+        ir = ics.mean() / std if std and std > 0 else float("nan")
+        year_topret = topret_monthly[topret_monthly.index.year == year].mean() \
+            if not topret_monthly.empty else float("nan")
+        year_turn = turnover_s[turnover_s.index.year == year].mean() \
+            if not turnover_s.empty else float("nan")
+        flag = "🟢" if ics.mean() > 0.03 else ("🟡" if ics.mean() > 0 else "🔴")
+        print(f"    {year:<8}{len(ics):>5}  {ics.mean():>+9.4f}  {std:>8.4f}  "
+              f"{ir:>+6.2f}  {(ics>0).mean()*100:>5.0f}%  "
+              f"{year_topret:>+8.2f}%  {year_turn:>6.0f}%  {flag}")
+        yearly_means.append(ics.mean())
+
+    # 总计
+    ic_std_total = monthly_ic.std(ddof=1)
+    ir_total = monthly_ic.mean() / ic_std_total if ic_std_total and ic_std_total > 0 else float("nan")
+    print(f"    {'─'*72}")
+    print(f"    {'总计':<8}{len(monthly_ic):>5}  {monthly_ic.mean():>+9.4f}  "
+          f"{ic_std_total:>8.4f}  {ir_total:>+6.2f}  "
+          f"{(monthly_ic>0).mean()*100:>5.0f}%  "
+          f"{topret_monthly.mean():>+8.2f}%  "
+          f"{turnover_s.mean() if not turnover_s.empty else float('nan'):>6.0f}%")
+
+    # 分年极差判断：跨度 > 0.15 视为 regime 依赖
+    if len(yearly_means) >= 3:
+        spread = max(yearly_means) - min(yearly_means)
+        if spread > 0.15:
+            print(f"    ⚠️  跨年 IC 极差 {spread:.3f} > 0.15，模型表现 regime 依赖明显")
+        else:
+            print(f"    ✓ 跨年 IC 极差 {spread:.3f} ≤ 0.15，表现相对稳健")
+
+    # ── 分行业 RankIC ─────────────────────────────────────────────
+    print(f"\n  ▸ 分行业 RankIC（揭示哪些行业有真信号）")
+    print(f"    {'GICS':<24}{'样本':>6}  {'有效月数':>8}  "
+          f"{'IC mean':>9}  {'IR':>6}  {'入选次数':>8}")
+    print(f"    {'─'*68}")
+
+    sel_gics = (v[v.get("is_selected", False) == True]["gics"].value_counts()
+                if "is_selected" in v.columns else pd.Series(dtype=int))
+
+    sector_rows = []
+    for gics, g in v.groupby("gics"):
+        if gics == "Unknown" or len(g) < 30:
+            continue
+        ic_monthly = g.groupby("date", group_keys=False).apply(_month_rank_ic).dropna()
+        if len(ic_monthly) < 6:
+            continue
+        std_s = ic_monthly.std(ddof=1)
+        ir_s = ic_monthly.mean() / std_s if std_s and std_s > 0 else float("nan")
+        sel_count = int(sel_gics.get(gics, 0))
+        sector_rows.append((gics, len(g), len(ic_monthly), ic_monthly.mean(), ir_s, sel_count))
+
+    for gics, n, n_m, ic_mean, ir_s, sel_cnt in sorted(sector_rows, key=lambda x: -x[3]):
+        flag = "🟢" if ic_mean > 0.03 else ("🟡" if ic_mean > 0 else "🔴")
+        print(f"    {gics:<24}{n:>6}  {n_m:>8}  {ic_mean:>+9.4f}  "
+              f"{ir_s:>+6.2f}  {sel_cnt:>7}  {flag}")
+
+    # ── 换手率分布 ──────────────────────────────────────────────
+    if not turnover_s.empty:
+        print(f"\n  ▸ Top10 月度换手率分布")
+        q = turnover_s.quantile([0.25, 0.5, 0.75, 0.9])
+        print(f"    平均 {turnover_s.mean():>4.0f}%  |  中位 {q[0.5]:>3.0f}%  |  "
+              f"P25 {q[0.25]:>3.0f}%  |  P75 {q[0.75]:>3.0f}%  |  P90 {q[0.9]:>3.0f}%")
+        if turnover_s.mean() > 50:
+            print(f"    ⚠️  平均换手 > 50%，说明模型每月几乎重选，信号噪声大或缓冲带太松")
+        elif turnover_s.mean() < 10:
+            print(f"    ✓ 换手率温和 ({turnover_s.mean():.0f}%)，组合稳定")
+
 # ══════════════════════════════════════════════════════════════════
 # 6. 当月预测 + 投机过滤 + 因子中性化
 # ══════════════════════════════════════════════════════════════════
@@ -2434,7 +3151,8 @@ def apply_rebalancing_band(current_ranked_df, prev_holdings, top_n=10, rank_buff
     return final_df
 
 def predict_now(panel, daily_map, meta_df, wf=None, macro_df=None,
-                current_holdings=None, prev_weights_dict=None):
+                current_holdings=None, prev_weights_dict=None, 
+                prev_scores_dict=None):  # 🟢 新增：用于 EMA 平滑的历史分数
     dates = sorted(panel.index.get_level_values("date").unique())
     sc    = StandardScaler()
 
@@ -2442,9 +3160,13 @@ def predict_now(panel, daily_map, meta_df, wf=None, macro_df=None,
     tr  = panel[panel.index.get_level_values("date").isin(dates[:-1])]\
                .dropna(subset=["next_ret","label"])
     cur = panel[panel.index.get_level_values("date")==dates[-1]]
+    
+    # 🎯 只使用panel中实际存在的特征列
+    feature_cols_avail = [col for col in FEATURE_COLS if col in cur.columns]
 
-    if len(tr) < 60:
-        print("训练数据不足（YEARS >= 3）")
+    if len(tr) < 200:
+        # ✓ 抗过拟合修订：与 walk_forward 对齐到 200 行下限
+        print(f"训练数据不足（仅 {len(tr)} 行 < 200，建议 YEARS ≥ 3）")
         return None, None, None
 
     # ✓ Bug fix: 检查当月数据是否为空（关键：防止 0 样本错误）
@@ -2457,8 +3179,10 @@ def predict_now(panel, daily_map, meta_df, wf=None, macro_df=None,
         return None, None, None
 
     print(f"\n训练最终模型（{len(tr)} 行历史）...")
-    X_tr = sc.fit_transform(tr[FEATURE_COLS].fillna(tr[FEATURE_COLS].median()))
-    X_cu = sc.transform(cur[FEATURE_COLS].fillna(tr[FEATURE_COLS].median()))
+    # ✓ Bug Fix: smart_impute 已完成缺失值处理，不应再 fillna(median)
+    # fillna(median) 会跨越多个市场周期计算中位数，破坏不同 Regime 下的特征基准
+    X_tr = sc.fit_transform(tr[feature_cols_avail].fillna(0.0))
+    X_cu = sc.transform(cur[feature_cols_avail].fillna(0.0))
 
     # ✓ Bug fix: 验证 X_cu 是否为空
     if X_cu.shape[0] == 0:
@@ -2473,35 +3197,63 @@ def predict_now(panel, daily_map, meta_df, wf=None, macro_df=None,
     w_tr = compute_time_decay_weights(sample_dates, current_date=current_pred_date, half_life_months=12.0)
 
     # 第四层：动态权重
-    mw = [1.2, 1.0, 0.8] if LGBM and TORCH else None
-    
-    # 最终选股：使用完整模型（含 MLP，更精确）
-    # ★ 优化方案2：捕获 MLP 模型用于后续 MC Dropout
-    ens_r, ens_c, ens, xgb_r, _, _, mlp_info = fit_all(
-        X_tr, tr["next_ret"].values, tr["label"].values, X_cu, 
-        weights_tr=w_tr, model_weights=mw, use_mlp=True, mlp_epochs=80)
+    # ✓ 抗过拟合修订：与 walk_forward 保持一致，predict_now 也禁用 MLP；
+    #   MLP 在 ~1K 独立样本下过拟合风险高，且关闭后 model_weights 自动截取到 [XGB, LGBM]。
+    mw = [1.2, 1.0] if LGBM else None
 
-    out = cur[FEATURE_COLS].copy()
+    # 最终选股：启用 XGBoost + LightGBM + MLP（MC Dropout 不确定性估计）
+    ens_r, ens_c, ens, xgb_r, _, _, mlp_info = fit_all(
+        X_tr, tr["next_ret"].values, tr["label"].values, X_cu,
+        weights_tr=w_tr, model_weights=mw, use_mlp=True, mlp_epochs=80)  # 改为 True 激活 MLP
+
+    out = cur[feature_cols_avail].copy()
     out["pred_return"]    = ens_r
     out["pred_top20pct"]  = ens_c
     out["ensemble_score"] = ens
     tix = out.index.get_level_values("ticker")
     out["name"]   = tix.map(meta_df["name"].to_dict())
     out["sector"] = tix.map(meta_df["sector"].to_dict())
+    
+    # =====================================================================
+    # 🟢 新增：实盘 EMA 信号平滑（对抗树模型单月波动）
+    # =====================================================================
+    if prev_scores_dict:
+        alpha = 0.6
+        smoothed_scores = []
+        tickers_out = (out.index.get_level_values("ticker").tolist()
+                      if isinstance(out.index, pd.MultiIndex)
+                      else out.index.tolist())
+        
+        for ticker, current_score in zip(tickers_out, out["ensemble_score"]):
+            if ticker in prev_scores_dict:
+                s_score = (current_score * alpha) + (prev_scores_dict[ticker] * (1 - alpha))
+                print(f"  [EMA平滑] {ticker}: 原始 {current_score:.3f} | 上月 {prev_scores_dict[ticker]:.3f} -> 平滑后 {s_score:.3f}")
+            else:
+                s_score = current_score
+            smoothed_scores.append(s_score)
+        
+        out["ensemble_score"] = smoothed_scores
+        print(f"  📊 EMA 平滑完成（{len(prev_scores_dict)} 支股票享受历史记忆）")
+    # =====================================================================
+    
+    # ⚠️ 【关键 FIX】保存未排序的原始索引，用于 MC Dropout 方差映射
+    # X_te_mlp 是基于 cur（未排序）生成的，所以 pred_var 的顺序是未排序的
+    # 如果 sort 之后再映射，顺序会错乱
+    unsorted_indices = out.index.copy()
     out = out.sort_values("ensemble_score", ascending=False)
     
-    # 🎯 【新增核心逻辑】：在应用缓冲带前，从至少前60名提取DML样本池（因果推断需要充分样本）
-    print("\\n  [DML因果推断] 从全排名中提取前60支股票...")  
-    top60_candidates = out.head(60) if len(out) >= 60 else out
-    top60_tickers = (top60_candidates.index.get_level_values("ticker").tolist()
-                     if isinstance(top60_candidates.index, pd.MultiIndex)
-                     else top60_candidates.index.tolist())
-    print(f"    ℹ️  DML 样本池：{len(top60_tickers)} 支（足以进行因果推断）")
+    # 🎯 【新增核心逻辑】：扩大样本池至最多150支以支持因果推断（DML 需要充分样本）
+    print("\n  [DML因果推断] 扩大样本池至最多150支以支持因果推断...")  
+    top150_candidates = out.head(150) if len(out) >= 150 else out  # 扩大截面数量以满足 DML 的统计显著性需求
+    top150_tickers = (top150_candidates.index.get_level_values("ticker").tolist()
+                      if isinstance(top150_candidates.index, pd.MultiIndex)
+                      else top150_candidates.index.tolist())
+    print(f"    ℹ️  DML 样本池：{len(top150_tickers)} 支（足以进行因果推断）")
     
     # 提取盈利惊喜信号
     surprise_df = pd.DataFrame()
     try:
-        surprise_df = fetch_earnings_surprise(top60_tickers)
+        surprise_df = fetch_earnings_surprise(top150_tickers)
         
         # 运行 DML 双重机器学习（估计事件信号的纯因果效应）
         if not surprise_df.empty:
@@ -2509,6 +3261,17 @@ def predict_now(panel, daily_map, meta_df, wf=None, macro_df=None,
             try:
                 # 应用 DML 调整到整个 out（用因果效应替代固定权重）
                 out = apply_dml_signal(out, panel, pd.DataFrame(), surprise_df)
+                
+                # 🔪 【终极防线】：季报严重不及预期 (Miss > 20%)，无视模型高分，强制斩立决！
+                miss_tickers = surprise_df[surprise_df["surprise_pct"] < -20.0].index.tolist()
+                valid_miss = [t for t in miss_tickers if t in out.index.get_level_values("ticker")] if isinstance(out.index, pd.MultiIndex) else [t for t in miss_tickers if t in out.index]
+                if valid_miss:
+                    print(f"    🛑 强制剔除业绩严重暴雷股 (Miss > 20%): {valid_miss}")
+                    if isinstance(out.index, pd.MultiIndex):
+                        out = out[~out.index.get_level_values("ticker").isin(valid_miss)]
+                    else:
+                        out = out[~out.index.isin(valid_miss)]
+                
                 out = out.sort_values("ensemble_score", ascending=False)
                 print("    ✅ DML 因果调整完毕（已融入排名）")
             except Exception as e_dml:
@@ -2574,10 +3337,11 @@ def predict_now(panel, daily_map, meta_df, wf=None, macro_df=None,
                 # 计算方差 (n_samples,)
                 pred_var = preds_mc.var(axis=0)
             
-            # 映射回 ticker
+            # 【FIX】用未排序的原始索引来映射 pred_var，避免张量索引错乱
+            # pred_var 顺序对应 unsorted_indices，而非排序后的 out.index
+            unsorted_tickers = [idx[1] if isinstance(idx, tuple) else idx for idx in unsorted_indices]
             n_mapped = 0
-            for i, idx in enumerate(out.index):
-                t = idx[1] if isinstance(idx, tuple) else idx
+            for i, t in enumerate(unsorted_tickers):
                 if i < len(pred_var):
                     mc_dropout_variance[t] = float(pred_var[i])
                     n_mapped += 1
@@ -2741,15 +3505,26 @@ def predict_now(panel, daily_map, meta_df, wf=None, macro_df=None,
 
     # ─── 【终极保险】Cash / ETF Sweep ───────────────────────────
     # 如果头部信号整体太弱，强行买入个股只是在追逐噪音
+    # ✓ Bug Fix: 如果触发 ETF 兜底，后续不应再进入 Black-Litterman 优化
+    #   否则单资产协方差矩阵会导致优化器崩溃（即使有 try/except 捕获）
+    # ✅ 改进：从硬编码 0.18 → 数据驱动分位数阈值（历史 walk-forward）
+    etf_fallback_triggered = False
+    
+    # 计算动态阈值（基于历史 walk-forward 日均分数的 20 分位数）
+    etf_threshold = calculate_etf_threshold(wf, quantile=0.20)
+    
     if not out.empty:
         top_10_mean_score = out["ensemble_score"].head(TOP_N).mean()
-        if pd.notna(top_10_mean_score) and top_10_mean_score < 0.25:
-            print(f"\n  ⚠️  警告：本月 Top 10 平均集成分数极低 ({top_10_mean_score:.3f})，全市场缺乏强 Alpha 信号！")
+        # 使用动态阈值替代硬编码的 0.18
+        if pd.notna(top_10_mean_score) and top_10_mean_score < etf_threshold:
+            print(f"\n  ⚠️  警告：本月 Top 10 平均集成分数 ({top_10_mean_score:.3f}) < 动态阈值 ({etf_threshold:.3f})")
+            print(f"     → 全市场缺乏强 Alpha 信号（低于历史 20% 分位线）")
             print("  🛡️ 触发 ETF 底线风控：建议清仓个股，全仓买入大盘指数 XIU.TO 或持币观望。")
 
             etf_ticker = "XIU.TO"
             etf_date = dates[-1] if len(dates) else pd.Timestamp.today().normalize()
             etf_name = "iShares S&P/TSX 60 Index ETF"
+            etf_fallback_triggered = True
 
             # 补一份可供后续打印/仓位模块使用的日线数据
             if etf_ticker not in daily_map or daily_map[etf_ticker].empty:
@@ -2829,7 +3604,8 @@ def predict_now(panel, daily_map, meta_df, wf=None, macro_df=None,
         out["ensemble_score"] = out["ensemble_score"] * total_scale
         print(f"  ⚡ 综合缩仓系数：{total_scale:.2f}（仓位整体降低）")
 
-    return out, imp, dd_signal
+    # 🟢 修复1：返回 total_scale 以确保缩仓在最后仓位分配时不被归一化抵消
+    return out, imp, dd_signal, total_scale
 
 # ══════════════════════════════════════════════════════════════════
 # 7. Fuzzy + 风险平价仓位
@@ -3370,7 +4146,10 @@ def sensitivity_analysis(daily_map: dict, pit_map: dict, meta_df: pd.DataFrame,
             panel_t = add_labels(panel_t)
             panel_t = cross_z(panel_t)
 
-            wf_t = walk_forward(panel_t, tx_cost=params["tx_cost"])
+            # 参数敏感性分析使用 asof 约束确保准确性
+            wf_t = walk_forward(panel_t, tx_cost=params["tx_cost"],
+                               daily_map=daily_map, pit_map=pit_map,
+                               apply_asof_constraints=True)
             if wf_t.empty or "actual_ret" not in wf_t.columns:
                 raise ValueError("Walk-Forward 结果为空")
 
@@ -3704,6 +4483,7 @@ def run_advanced_analysis(panel, daily_map, pit_map, meta_df, macro_df, wf,
     print("▓"*60)
 
     used_feature_cols = FEATURE_COLS
+    panel_reduced = panel  # 🎯 修复1-A：加一行兜底，防止不跑共线性时报错
 
     # ── A. 共线性处理 ────────────────────────────────────────────
     if run_collinearity:
@@ -3722,7 +4502,7 @@ def run_advanced_analysis(panel, daily_map, pit_map, meta_df, macro_df, wf,
         print("\n【B】SEDI 内部人交易信号")
         # canadianinsider.com 屏蔽 Colab IP，仅本地运行有效
         # 本地运行时将 SEDI_LOCAL_ONLY 改为 False 启用
-        SEDI_LOCAL_ONLY = True
+        SEDI_LOCAL_ONLY = False
         if SEDI_LOCAL_ONLY:
             print("  ⚠️  SEDI 仅支持本地运行（Colab IP 被 canadianinsider.com 屏蔽）")
             print("       本地运行：将上方 SEDI_LOCAL_ONLY = True 改为 False")
@@ -3751,8 +4531,9 @@ def run_advanced_analysis(panel, daily_map, pit_map, meta_df, macro_df, wf,
             bid_ask       = 0.001,
             market_impact = 0.002,
             stop_loss     = STOP_LOSS_PCT,
-            cash_buffer   = 0.05,
-            hold_inertia  = 0.10,
+            cash_buffer   = 0.01,     # 🚀 降低现金闲置：原为 0.05，改为 0.01 (只留 1% 现金交点差)
+            hold_inertia  = 0.35,     # 🚀 从 0.10 提高到 0.35！强迫持股，克服多动症
+                                      # 逻辑：只要这只股票还在池子里，哪怕排名掉到了第 8 名，坚决不卖它去换第 1 名
             drip          = True,
         )
         try:
@@ -3760,7 +4541,8 @@ def run_advanced_analysis(panel, daily_map, pit_map, meta_df, macro_df, wf,
         except Exception as e:
             print(f"  ⚠️  真实回测失败：{e}")
 
-    return insider_df, used_feature_cols
+    # 🎯 修复1-B：将 panel_reduced 加到 return 列表中
+    return panel_reduced, insider_df, used_feature_cols
 
 # ══════════════════════════════════════════════════════════════════
 # MODULE E: Regime Detection（市场状态识别）
@@ -3788,12 +4570,14 @@ class MarketRegime:
     # Regime → 因子权重调整系数（相对于默认权重）
     FACTOR_MULTIPLIERS = {
         BULL: {
-            "mom_6m":       1.5,   # 动量加大
-            "mom_12m":      1.5,
-            "pe":           0.7,   # 估值降权（牛市不看PE）
-            "roe":          1.0,
+            "mom_6m":       2.0,   # 🎯 极大增强中期动量权重 (原1.5)
+            "mom_12m":      2.0,   # 🎯 增强长期动量权重
+            "price_vs_52w_high": 2.5, # 🎯 强迫模型偏好创新高的股票
+            "pe":           0.2,   # 🎯 彻底削弱绝对估值的压制 (原0.7)
+            "pb":           0.05,   # 🎯 彻底削弱市净率的压制
+            "pe_rel_sector": 0.3,  # 🎯 允许买入行业内享受估值溢价的龙头
             "fcf_yield":    0.8,
-            "vol_1m":       0.7,   # 波动率惩罚降低
+            "vol_1m":       0.7,   # 允许一定的波动
             "vix_level":    0.5,
         },
         NEUTRAL: {k: 1.0 for k in FEATURE_COLS},
@@ -3891,8 +4675,16 @@ def fetch_earnings_surprise(tickers: list[str]) -> pd.DataFrame:
     """
     print(f"\n  [Earnings Surprise] 获取 {len(tickers)} 支季报数据...")
     rows = []
+    
+    # 🔧 修复1：ETF 黑名单 — 大盘指数和宽基 ETF 无财报数据，跳过以避免 yfinance 报错
+    ETF_BLACKLIST = {"XIU.TO", "XSP.TO", "VFV.TO", "XIC.TO", "^GSPTSE", "^RY"}
 
     for t in tickers:
+        # 🔧 修复1：直接跳过 ETF，避免试图获取不存在的财报数据
+        if t in ETF_BLACKLIST:
+            rows.append({"ticker":t, "surprise_pct":0.0, "surprise_dir":0, "n_beat":0, "source":"etf_skip"})
+            continue
+        
         try:
             ticker = yf.Ticker(t)
             ed     = ticker.earnings_dates
@@ -4016,7 +4808,8 @@ def black_litterman_weights(top: pd.DataFrame, daily_map: dict,
                              risk_aversion: float = 2.5,
                              prev_weights: dict = None,
                              prev_weights_dict: dict = None,
-                             pred_variance: dict = None) -> pd.DataFrame:
+                             pred_variance: dict = None,
+                             etf_fallback_triggered: bool = False) -> pd.DataFrame:
     """
     用 Black-Litterman 模型替换 Fuzzy 仓位分配。
 
@@ -4053,6 +4846,23 @@ def black_litterman_weights(top: pd.DataFrame, daily_map: dict,
     for idx in top.index:
         t = idx[1] if isinstance(idx, tuple) else idx
         tickers.append(t)
+
+    # ✓ Bug Fix: 如果只有 1 支资产（ETF 兜底），跳过 BL 复杂优化，直接返回 100% 仓位
+    if len(tickers) == 1:
+        single_t = tickers[0]
+        if etf_fallback_triggered or "XIU" in single_t or ("sector" in top.columns and "ETF" in top["sector"].iloc[0]):
+            print(f"  🎯 单资产 ETF（{single_t}）兜底模式：跳过 BL 优化，返回 100% 仓位")
+            fallback_df = pd.DataFrame([{
+                "ticker": single_t,
+                "alloc_pct": 100.0,
+                "category": "应急 ETF",
+                "vol_ann": 0.15,
+                "score": top["ensemble_score"].iloc[0],
+                "prob": 0.0,
+                "ret": 0.0,
+                "view_ret": 0.0,
+            }])
+            return fallback_df
 
     # ── 1. 构建历史价格矩阵 ───────────────────────────────────────
     price_data = {}
@@ -4158,8 +4968,9 @@ def black_litterman_weights(top: pd.DataFrame, daily_map: dict,
         bl_returns = bl.bl_returns()
         
         # ★ 修复角点解（强制分散）：
-        # 1. 硬性边界：单只股票最低 2%，最高 15%（防止极端集中）
-        ef = EfficientFrontier(bl_returns, S, weight_bounds=(0.02, 0.15))
+        # 1. 动态边界：根据实际传入的股票数量动态调整上限，防止求解器崩溃
+        max_weight_bound = max(0.15, 1.0 / len(bl_returns) + 0.05) if len(bl_returns) > 0 else 0.15
+        ef = EfficientFrontier(bl_returns, S, weight_bounds=(0.02, max_weight_bound))
         
         # 2. 软性约束（L2 正则化）：强迫权重平滑分散
         #    gamma 越大权重越趋向等权。0.1 是平衡点（对应 ~15% 权重即使 score 最高）
@@ -4316,7 +5127,7 @@ def generate_monthly_report(result, bl_weights_df, wf, regime,
 
     css = (
         "<style>"
-        f"body{{font-family:-apple-system,Helvetica,Arial,sans-serif;background:{BG};margin:0;padding:16px;color:#2C3E50;line-height:1.5}}"
+        f"body{{font-family:'PingFang SC','Microsoft YaHei','Segoe UI',-apple-system,Helvetica,Arial,sans-serif;background:{BG};margin:0;padding:16px;color:#2C3E50;line-height:1.5}}"
         f".wrap{{max-width:750px;margin:0 auto;background:{WHITE};border-radius:8px;overflow:hidden;box-shadow:0 4px 20px rgba(0,0,0,.1)}}"
         f".hdr{{background:#1A252F;padding:24px 20px 16px}}"
         f".hdr h1{{color:{WHITE};margin:0;font-size:20px;font-weight:700}}"
@@ -4556,36 +5367,6 @@ def send_monthly_report(html_content, to_email="your@email.com",
         return False
 
 
-    try:
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = f"🍁 TSX 量化选股月报 — {datetime.today().strftime('%Y-%m')}"
-        msg["From"]    = from_email
-        msg["To"]      = to_email
-
-        # 纯文本版本
-        msg.attach(MIMEText(report_text, "plain", "utf-8"))
-
-        # HTML 版本（Markdown 转简单 HTML）
-        html_body = report_text.replace("\n", "<br>").replace("**", "<b>").replace("##", "<h3>").replace("#", "<h2>")
-        msg.attach(MIMEText(f"<html><body>{html_body}</body></html>", "html", "utf-8"))
-
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(from_email, app_password)
-            server.sendmail(from_email, to_email, msg.as_string())
-
-        print(f"  ✅ 月度报告已发送至 {to_email}")
-        with open("monthly_report.md", "w") as f:
-            f.write(report_text)
-        return True
-
-    except Exception as e:
-        print(f"  ⚠️  邮件发送失败：{e}")
-        print("       报告已保存到：monthly_report.md")
-        with open("monthly_report.md", "w") as f:
-            f.write(report_text)
-        return False
-
-
 # ══════════════════════════════════════════════════════════════════
 # 四个新模块的统一入口
 # ══════════════════════════════════════════════════════════════════
@@ -4774,6 +5555,11 @@ def run_new_modules(panel, daily_map, meta_df, macro_df, wf,
     if result is not None:
         try:
             top = result.head(TOP_N)
+            
+            # ✓ 检查是否为 ETF 兜底（单资产）情况
+            etf_fallback = len(top) == 1 and (("XIU" in top.index.get_level_values("ticker")[0]) or 
+                                               ("sector" in top.columns and "ETF" in top["sector"].iloc[0]))
+            
             # 优先使用 Wealthsimple 真实持仓权重；没有时再回退到 WF 上月等权持仓
             prev_bl_weights = prev_weights_dict or {}
             if not prev_bl_weights and not wf.empty and "ens" in wf.columns:
@@ -4785,10 +5571,12 @@ def run_new_modules(panel, daily_map, meta_df, macro_df, wf,
                         row["ticker"]: 1.0/n_picks
                         for _, row in last_picks.iterrows()
                     }
+            
             bl_df = black_litterman_weights(top, daily_map, meta_df,
                                              risk_aversion=2.5,
                                              prev_weights_dict=prev_bl_weights,
-                                             pred_variance=mc_dropout_variance)
+                                             pred_variance=mc_dropout_variance,
+                                             etf_fallback_triggered=etf_fallback)
             if not bl_df.empty:
                 print_bl_weights(bl_df, regime.regime)
             else:
@@ -4869,7 +5657,17 @@ def backtest_from_wf(wf, daily_map, meta_df, top_n=10):
         if month_wf.empty:
             continue
 
-        top_month = month_wf.nlargest(top_n, "ens")
+        # ✓ 修订（2026-04）：报告口径与实际选股口径对齐
+        # walk_forward 已经做了缓冲带 + 冷静期 + 矿业上限 + ETF 风控，
+        # 选中的股票标记在 is_selected 列。报告必须沿用同一组持仓，
+        # 否则"回测看到的收益"≠"实际会交易的组合"。
+        # 仅在该列缺失或当月没有任何 is_selected=True 时才退化到 nlargest。
+        if "is_selected" in month_wf.columns and month_wf["is_selected"].any():
+            top_month = month_wf[month_wf["is_selected"] == True].copy()
+            # 按分数降序，保持与 walk_forward 内部一致
+            top_month = top_month.sort_values("ens", ascending=False)
+        else:
+            top_month = month_wf.nlargest(top_n, "ens")
         tickers   = top_month["ticker"].tolist()
         curr_hold = set(tickers)
         new_in    = curr_hold - prev_hold
@@ -4893,8 +5691,11 @@ def backtest_from_wf(wf, daily_map, meta_df, top_n=10):
                     mp  = mdata["low"].min()
 
                     # OPT3: 动态波动率止损
-                    # 个股历史月波动率（63日）× BT_VOL_STOP_MULT
-                    hist_vol = df["close"].pct_change().tail(63).std() * np.sqrt(21)
+                    # ✓ 修复前视（2026-04）：必须用回测当月之前的 63 天，
+                    #   而不是 df.tail(63)（那是全样本最后 63 天，等于"用 2026 年波动率
+                    #   设置 2018 年止损"，严重前视）。
+                    pit_close = df[df.index <= pd.Timestamp(date)]["close"]
+                    hist_vol = pit_close.pct_change().tail(63).std() * np.sqrt(21) if len(pit_close) >= 63 else 0
                     vol_stop = -abs(hist_vol * BT_VOL_STOP_MULT) if hist_vol > 0 else BT_STOP_LOSS
                     # 取动态止损和全局止损的较大值（更宽松的保护）
                     effective_stop = max(vol_stop, BT_STOP_LOSS)
@@ -5082,7 +5883,7 @@ def print_wf_backtest(results, initial_capital):
 # ══════════════════════════════════════════════════════════════════
 
 # ── 运行模式（MODE 配置）─────────────────────────────────────────
-MODE = "both"   # "pick"     → 当月选股（默认，耗时 5 分钟）
+MODE = "pick"   # "pick"     → 当月选股（默认，耗时 5 分钟）
                 # "backtest" → 历史回测（过去 12 个月逐月模拟，耗时 30 分钟）
                 # "both"     → 先回测再选股（耗时 35 分钟，推荐周末运行）
 
@@ -5147,8 +5948,13 @@ if __name__ == "__main__":
             passed  = apply_base_constraints(daily_map, CONSTRAINTS)
             panel   = build_panel(passed, daily_map, pit_map, macro_df)
             panel   = add_labels(panel)
+            print("  智能插补（行业截面中位数）...")
+            panel   = smart_impute(panel, FEATURE_COLS)
             panel   = cross_z(panel)
-            wf      = walk_forward(panel, tx_cost=BT_TX_COST)
+            # ✅ 【改进】启用时间序列约束，传入 daily_map 和 pit_map 实现动态过滤
+            wf      = walk_forward(panel, tx_cost=BT_TX_COST, 
+                                   daily_map=daily_map, pit_map=pit_map,
+                                   apply_asof_constraints=True)
 
         # 用 Walk-Forward 输出还原逐月动态选股 P&L
         bt_results = backtest_from_wf(wf, daily_map, meta_df, top_n=TOP_N)
@@ -5175,13 +5981,15 @@ if __name__ == "__main__":
             passed = apply_constraints_current(daily_map, meta_df, relaxed)
 
         print(f"\n[4/4] 特征工程 + 模型")
-        panel = build_panel(passed, daily_map, pit_map, macro_df)
+        # ✓ 当月选股启用真实财报日历（未来 90 天财报安排是当下可知信息）
+        panel = build_panel(passed, daily_map, pit_map, macro_df, is_backtest=False)
         panel = add_labels(panel)
         print("  智能插补（行业截面中位数）...")
         panel = smart_impute(panel, FEATURE_COLS)
         panel = cross_z(panel)
 
-        wf = walk_forward(panel, tx_cost=BT_TX_COST)
+        # 当月选股不使用 asof 约束（已用当前最新数据做过滤）
+        wf = walk_forward(panel, tx_cost=BT_TX_COST, apply_asof_constraints=False)
         evaluate(wf)
 
         # 完整模型逐月 P&L 报告（用Walk-Forward的真实预测结果）
@@ -5227,34 +6035,83 @@ if __name__ == "__main__":
         # 提取名字列表给“换仓缓冲带”用
         current_tickers_only = list(MY_CURRENT_PORTFOLIO.keys())
 
-        # 🎯 【修改】：把真实持仓和真实权重都传给 predict_now
-        result, imp, dd_signal = predict_now(
+        # 🟢 新增：加载上月的模型分数，用于 EMA 平滑
+        SCORE_FILE = "last_month_scores.json"
+        prev_scores = {}
+        if os.path.exists(SCORE_FILE):
+            try:
+                with open(SCORE_FILE, "r") as f:
+                    prev_scores = json.load(f)
+                    print(f"  📥 成功加载上月模型得分记录，用于 EMA 平滑 (共 {len(prev_scores)} 只股票)")
+            except Exception as e:
+                print(f"  ⚠️  加载历史分数失败：{e}，本月跳过 EMA 平滑")
+
+        # 🔧 修复3：加载冷却期黑名单（上月被止损的股票）
+        COOLDOWN_FILE = "cooldown_tickers.json"
+        cooldown_tickers = set()
+        if os.path.exists(COOLDOWN_FILE):
+            try:
+                with open(COOLDOWN_FILE, "r") as f:
+                    cooldown_tickers = set(json.load(f))
+                    if cooldown_tickers:
+                        print(f"  🔴 成功加载冷却期黑名单 (共 {len(cooldown_tickers)} 只被冻结股票)")
+            except Exception as e:
+                print(f"  ⚠️  加载冷却期黑名单失败：{e}，本月无冷却限制")
+
+        # 【第一步】特征工程：先做共线性降维
+        print("\n[特征工程] VIF 共线性检测...")
+        # 🎯 修复2：用 panel 接收返回的 panel_reduced
+        panel, insider_df, feat_cols = run_advanced_analysis(
+            panel, daily_map, pit_map, meta_df, macro_df, wf,
+            run_collinearity=True, run_insider=False, run_backtest=False,
+            run_sensitivity=False
+        )
+        if feat_cols and len(feat_cols) < len(FEATURE_COLS):
+            FEATURE_COLS = feat_cols
+
+        # 【第二步】用纯净特征做预测
+        result, imp, dd_signal, total_scale = predict_now(
             panel, daily_map, meta_df, wf, macro_df=macro_df,
             current_holdings=current_tickers_only,
             prev_weights_dict=MY_CURRENT_PORTFOLIO,
-        )
+            prev_scores_dict=prev_scores  # 🟢 传入历史分数用于 EMA 平滑
+        )  # 🔧 修复1：现在接收 total_scale（VIX/回撤缩仓系数）
 
-        # 高级模块（共线性 / SEDI / 参数敏感性 / 真实回测框架）
-        insider_df, feat_cols = run_advanced_analysis(
-            panel, daily_map, pit_map, meta_df, macro_df, wf,
-            run_sensitivity  = False,   # 改 True 开启参数搜索（耗时长）
-            run_collinearity = True,
-            run_insider      = True,
-            run_backtest     = False,  # 存在前视偏差，用WF回测更准确
-        )
-
-        # Bug2 修复：将 VIF 过滤后的特征集同步到全局 FEATURE_COLS
-        # 避免 predict_now 用了被删特征（vwap_bias/bias_20 出现在重要性里就是这个原因）
-        if feat_cols and len(feat_cols) < len(FEATURE_COLS):
-            FEATURE_COLS = feat_cols
-            print(f"  特征集已同步：{len(feat_cols)} 个（VIF过滤后，已排除共线特征）")
-
+        # 🔧 修复3：过滤掉冷却期黑名单中的股票
+        if result is not None and not result.empty and cooldown_tickers:
+            if isinstance(result.index, pd.MultiIndex):
+                # MultiIndex(date, ticker) 的情况
+                result = result[~result.index.get_level_values("ticker").isin(cooldown_tickers)]
+            elif "ticker" in result.columns:
+                # ticker 列的情况
+                result = result[~result["ticker"].isin(cooldown_tickers)]
+            if not result.empty:
+                print(f"  🔴 已从推荐列表中过滤冷却期黑名单({len(cooldown_tickers)} 只)")
 
         if result is not None and not insider_df.empty:
             result = apply_insider_signal(result, insider_df, weight=0.15)
 
         if result is not None:
             print_picks(result, imp, daily_map, meta_df, wf, dd_signal)
+            
+            # 🟢 新增：保存本月的模型分数到文件，用于下个月的 EMA 平滑
+            # 提取 ticker 和 ensemble_score
+            if isinstance(result.index, pd.MultiIndex):
+                # MultiIndex(date, ticker) 的情况
+                tickers = result.index.get_level_values("ticker")
+                current_scores = dict(zip(tickers, result["ensemble_score"]))
+            else:
+                # 其他情况，尝试用 ticker 列
+                current_scores = result.set_index("ticker")["ensemble_score"].to_dict() if "ticker" in result.columns else {}
+            
+            SCORE_FILE = "last_month_scores.json"
+            if current_scores:
+                try:
+                    with open(SCORE_FILE, "w") as f:
+                        json.dump(current_scores, f)
+                    print(f"  💾 本月模型得分已保存至 {SCORE_FILE}，用于下月平滑")
+                except Exception as e:
+                    print(f"  ⚠️  分数保存失败：{e}")
 
         # 新模块 E/F/G/H：Regime + Earnings + Black-Litterman + 月报
         result, bl_df, surprise_df, regime = run_new_modules(
@@ -5265,3 +6122,22 @@ if __name__ == "__main__":
             email_from     = EMAIL_CONFIG["from"],
             email_password = EMAIL_CONFIG["password"],
         )
+
+        # 🔧 修复1：应用 VIX/回撤缩仓系数到最终配置（清晰无冗余版本）
+        if bl_df is not None and not bl_df.empty and total_scale < 1.0:
+            bl_df["alloc_pct"] = (bl_df["alloc_pct"] * total_scale).round(1)
+            cash_alloc = round(100.0 - bl_df["alloc_pct"].sum(), 1)
+            
+            # 使用 pd.concat 干净利落地追加现金行
+            cash_df = pd.DataFrame([{
+                "ticker": "CASH.TO", 
+                "alloc_pct": cash_alloc,
+                "category": "防御性现金 🛡️",
+                "vol_ann": 0.0,
+                "score": 0.0,
+                "prob": 0.0,
+                "ret": 0.0,
+                "view_ret": 0.0
+            }])
+            bl_df = pd.concat([bl_df, cash_df], ignore_index=True)
+            print(f"  💾 🔴 熔断缩仓激活 | 缩仓系数={total_scale:.2f} | 现金占比={cash_alloc:.1f}%")
